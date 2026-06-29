@@ -375,7 +375,8 @@ async def cmd_newarrival(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(caption)
 
-        time.sleep(0.5)
+        import asyncio
+        await asyncio.sleep(0.5)
 
 # ─── /debug command ─────────────────────────────────────────────────
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
