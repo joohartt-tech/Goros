@@ -592,5 +592,41 @@ app.add_handler(CommandHandler("belt", cmd_belt))
 app.add_handler(CommandHandler("concho", cmd_concho))
 app.add_handler(CommandHandler("gold", cmd_gold))
 
-print("Bot is running...")
-app.run_polling()
+import asyncio
+
+async def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # handlers
+    app.add_handler(CommandHandler("C", convert))
+    app.add_handler(CommandHandler("list", list_currencies))
+    app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("newarrival", cmd_newarrival))
+    app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CommandHandler("feather", cmd_feather))
+    app.add_handler(CommandHandler("largefeather", cmd_largefeather))
+    app.add_handler(CommandHandler("wheel", cmd_wheel))
+    app.add_handler(CommandHandler("hook", cmd_hook))
+    app.add_handler(CommandHandler("sunmetal", cmd_sunmetal))
+    app.add_handler(CommandHandler("eagle", cmd_eagle))
+    app.add_handler(CommandHandler("ring", cmd_ring))
+    app.add_handler(CommandHandler("brace", cmd_brace))
+    app.add_handler(CommandHandler("chain", cmd_chain))
+    app.add_handler(CommandHandler("metal", cmd_metal))
+    app.add_handler(CommandHandler("cross", cmd_cross))
+    app.add_handler(CommandHandler("belt", cmd_belt))
+    app.add_handler(CommandHandler("concho", cmd_concho))
+    app.add_handler(CommandHandler("gold", cmd_gold))
+
+    print("Bot started...")
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+
+    # keep running forever
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
