@@ -1,48 +1,31 @@
-import cloudscraper
+import asyncio
 import time
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+import cloudscraper
+import requests
 from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+
+# ─── Constants ──────────────────────────────────────────────────────
+BOT_TOKEN = "8517153660:AAExRG-RKm2SeeZ7xF7JTp8dBWwc0jOYh4U"
 
 CURRENCY_COUNTRY = {
-    "SGD": "Singapore",
-    "JPY": "Japan",
-    "CNY": "China",
-    "MYR": "Malaysia",
-    "USD": "United States",
-    "EUR": "Eurozone",
-    "GBP": "United Kingdom",
-    "AUD": "Australia",
-    "NZD": "New Zealand",
-    "HKD": "Hong Kong",
-    "KRW": "South Korea",
-    "THB": "Thailand",
-    "IDR": "Indonesia",
-    "PHP": "Philippines",
-    "INR": "India",
-    "CAD": "Canada",
-    "CHF": "Switzerland"
+    "SGD": "Singapore",       "JPY": "Japan",          "CNY": "China",
+    "MYR": "Malaysia",        "USD": "United States",  "EUR": "Eurozone",
+    "GBP": "United Kingdom",  "AUD": "Australia",      "NZD": "New Zealand",
+    "HKD": "Hong Kong",       "KRW": "South Korea",    "THB": "Thailand",
+    "IDR": "Indonesia",       "PHP": "Philippines",    "INR": "India",
+    "CAD": "Canada",          "CHF": "Switzerland",
 }
 
 CURRENCY_FLAG = {
-    "SGD": "🇸🇬",
-    "JPY": "🇯🇵",
-    "CNY": "🇨🇳",
-    "MYR": "🇲🇾",
-    "USD": "🇺🇸",
-    "EUR": "🇪🇺",
-    "GBP": "🇬🇧",
-    "AUD": "🇦🇺",
-    "NZD": "🇳🇿",
-    "HKD": "🇭🇰",
-    "KRW": "🇰🇷",
-    "THB": "🇹🇭",
-    "IDR": "🇮🇩",
-    "PHP": "🇵🇭",
-    "INR": "🇮🇳",
-    "CAD": "🇨🇦",
-    "CHF": "🇨🇭"
+    "SGD": "🇸🇬", "JPY": "🇯🇵", "CNY": "🇨🇳", "MYR": "🇲🇾",
+    "USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "AUD": "🇦🇺",
+    "NZD": "🇳🇿", "HKD": "🇭🇰", "KRW": "🇰🇷", "THB": "🇹🇭",
+    "IDR": "🇮🇩", "PHP": "🇵🇭", "INR": "🇮🇳", "CAD": "🇨🇦",
+    "CHF": "🇨🇭",
 }
 
 CATEGORY_KEYWORDS = {
@@ -62,18 +45,13 @@ CATEGORY_KEYWORDS = {
     "gold":         ["gold", "Gold", "ゴールド", "金"],
 }
 
-BOT_TOKEN = "8517153660:AAExRG-RKm2SeeZ7xF7JTp8dBWwc0jOYh4U"
-
 # ─── Cache ──────────────────────────────────────────────────────────
-price_cache = {
-    "data": None,
-    "timestamp": 0
-}
+price_cache = {"data": None, "timestamp": 0}
 CACHE_DURATION = 3600
-
-# ─── Translation cache ──────────────────────────────────────────────
 translation_cache = {}
 
+
+# ─── Helpers ────────────────────────────────────────────────────────
 def is_japanese(text):
     return any(
         '\u3000' <= c <= '\u9fff' or
@@ -82,6 +60,7 @@ def is_japanese(text):
         for c in text
     )
 
+
 def translate_to_english(text):
     if text in translation_cache:
         return translation_cache[text]
@@ -89,21 +68,39 @@ def translate_to_english(text):
         result = GoogleTranslator(source='ja', target='en').translate(text)
         translation_cache[text] = result
         return result
-    except:
+    except Exception:
         return text
 
-# ─── Fetch exchange rates ───────────────────────────────────────────
+
 def get_rates(base="SGD"):
-    import requests
     url = f"https://open.er-api.com/v6/latest/{base}"
     try:
         response = requests.get(url, timeout=10)
         response.raise_for_status()
-        data = response.json()
-        return data.get("rates", {})
+        return response.json().get("rates", {})
     except Exception as e:
-        print("Error fetching rates:", e)
+        print(f"Error fetching rates: {e}")
         return {}
+
+
+def format_price(price_str, sgd_rate):
+    try:
+        numeric = float(
+            price_str.replace("￥", "").replace("¥", "").replace(",", "").strip()
+        )
+        if sgd_rate:
+            sgd_amount = numeric * sgd_rate
+            return f"💴 {price_str} ≈ 💵 SGD {sgd_amount:,.2f}"
+        return price_str
+    except Exception:
+        return price_str
+
+
+def make_scraper():
+    return cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+
 
 # ─── Scrape Goro's price list ───────────────────────────────────────
 def get_goros_prices_grouped():
@@ -112,11 +109,8 @@ def get_goros_prices_grouped():
         return price_cache["data"]
 
     url = "https://www.eaglecapitalone.com/goros-kaitorikakakuhyo/"
-
     try:
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
+        scraper = make_scraper()
         print("Visiting homepage first...")
         scraper.get("https://www.eaglecapitalone.com/", timeout=20)
         time.sleep(3)
@@ -129,12 +123,10 @@ def get_goros_prices_grouped():
             return price_cache["data"] or []
 
         soup = BeautifulSoup(response.text, "html.parser")
-        tables = soup.find_all("table")
-        headings = soup.find_all(["h1", "h2", "h3", "h4"])
-        print(f"Tables: {len(tables)}, Headings: {len(headings)}")
+        print(f"Tables: {len(soup.find_all('table'))}, Headings: {len(soup.find_all(['h1','h2','h3','h4']))}")
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Scraper error: {e}")
         return price_cache["data"] or []
 
     grouped = []
@@ -146,39 +138,34 @@ def get_goros_prices_grouped():
             if current_items:
                 grouped.append({"section": current_section, "items": current_items})
                 current_items = []
-            raw_heading = element.get_text(strip=True)
-            current_section = translate_to_english(raw_heading)
+            current_section = translate_to_english(element.get_text(strip=True))
         elif element.name == "table":
-            rows = element.find_all("tr")
-            for row in rows:
+            for row in element.find_all("tr"):
                 cols = row.find_all("td")
                 if len(cols) == 2:
                     item_jp = cols[0].get_text(strip=True)
                     price   = cols[1].get_text(strip=True)
-                    item_en = translate_to_english(item_jp)
                     current_items.append({
-                        "item_en": item_en,
+                        "item_en": translate_to_english(item_jp),
                         "item_jp": item_jp,
-                        "price":   price
+                        "price":   price,
                     })
 
     if current_items:
         grouped.append({"section": current_section, "items": current_items})
 
     print(f"Total sections: {len(grouped)}")
-
     if grouped:
         price_cache["data"] = grouped
         price_cache["timestamp"] = time.time()
 
     return grouped
 
+
 # ─── Scrape new arrivals ────────────────────────────────────────────
 def get_new_arrivals():
     try:
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
+        scraper = make_scraper()
         response = scraper.get("https://www.eaglecapitalone.com/", timeout=20)
         print(f"Homepage status: {response.status_code}")
 
@@ -187,7 +174,6 @@ def get_new_arrivals():
 
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # Find new arrivals heading
         update_date = ""
         new_arrival_section = None
         for h in soup.find_all(["h1", "h2", "h3", "h4"]):
@@ -195,29 +181,22 @@ def get_new_arrivals():
             if "新着" in text and "入荷" not in text:
                 update_date = translate_to_english(text)
                 new_arrival_section = h
-                print(f"Found: {text}")
+                print(f"Found heading: {text}")
                 break
 
         if not new_arrival_section:
             return [], ""
 
-        # Collect name+price pairs using [a] and [strong] pattern
-        names = []
-        prices = []
-        imgs = []
+        names, prices, imgs = [], [], []
 
         for sibling in new_arrival_section.find_all_next():
             if sibling.name in ["h1", "h2", "h3", "h4"]:
                 if "カテゴリ" in sibling.get_text(strip=True):
                     break
 
-            # Collect product names from <a> tags
-            if sibling.name == "a" and sibling.string and sibling.string.strip():
-                name = sibling.string.strip()
-                if len(name) > 1:
-                    names.append(name)
+            if sibling.name == "a" and sibling.string and len(sibling.string.strip()) > 1:
+                names.append(sibling.string.strip())
 
-            # Collect images from <a> tags containing <img>
             if sibling.name == "a":
                 img = sibling.find("img")
                 if img and img.get("src"):
@@ -228,7 +207,6 @@ def get_new_arrivals():
                         src = "https://www.eaglecapitalone.com" + src
                     imgs.append(src)
 
-            # Collect prices from <strong> tags
             if sibling.name == "strong" and sibling.string:
                 price = sibling.string.strip()
                 if "￥" in price or "¥" in price:
@@ -236,77 +214,47 @@ def get_new_arrivals():
 
         print(f"Names: {len(names)}, Prices: {len(prices)}, Images: {len(imgs)}")
 
-        # Build items by pairing name + price + image
         items = []
         for idx in range(min(len(names), len(prices))):
             name_jp = names[idx]
-            price_str = prices[idx]
-            img_url = imgs[idx] if idx < len(imgs) else None
-
-            # Check if reserved/exclusive sale
-            is_reserved = "専用販売" in name_jp
-            name_en = translate_to_english(name_jp) if is_japanese(name_jp) else name_jp
-
             items.append({
                 "name_jp":     name_jp,
-                "name_en":     name_en,
-                "price":       price_str,
-                "img_url":     img_url,
-                "is_reserved": is_reserved
+                "name_en":     translate_to_english(name_jp) if is_japanese(name_jp) else name_jp,
+                "price":       prices[idx],
+                "img_url":     imgs[idx] if idx < len(imgs) else None,
+                "is_reserved": "専用販売" in name_jp,
             })
 
         print(f"Total items: {len(items)}")
         return items, update_date
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"New arrivals error: {e}")
         return [], ""
 
-# ─── Format price ───────────────────────────────────────────────────
-def format_price(price_str, sgd_rate):
-    try:
-        numeric = float(
-            price_str.replace("￥", "").replace("¥", "").replace(",", "").strip()
-        )
-        if sgd_rate:
-            sgd_amount = numeric * sgd_rate
-            return f"💴 {price_str} ≈ 💵 SGD {sgd_amount:,.2f}"
-        return price_str
-    except:
-        return price_str
 
-# ─── Send grouped results ───────────────────────────────────────────
+# ─── Shared search helper ────────────────────────────────────────────
 async def send_grouped_results(update, title, keywords=None, keyword=None):
     await update.message.reply_text("🔍 Searching... please wait (translation in progress)")
 
-    rates = get_rates(base="JPY")
-    sgd_rate = rates.get("SGD", None)
-
-    grouped = get_goros_prices_grouped()
+    rates    = get_rates(base="JPY")
+    sgd_rate = rates.get("SGD")
+    grouped  = get_goros_prices_grouped()
     found_any = False
 
     for section in grouped:
         if keywords:
             section_match = any(kw.lower() in section["section"].lower() for kw in keywords)
-            if section_match:
-                items = section["items"]
-            else:
-                items = [
-                    i for i in section["items"]
-                    if any(kw.lower() in i["item_en"].lower() or
-                           kw in i["item_jp"]
-                           for kw in keywords)
-                ]
+            items = section["items"] if section_match else [
+                i for i in section["items"]
+                if any(kw.lower() in i["item_en"].lower() or kw in i["item_jp"] for kw in keywords)
+            ]
         elif keyword:
             section_match = keyword.lower() in section["section"].lower()
-            if section_match:
-                items = section["items"]
-            else:
-                items = [
-                    i for i in section["items"]
-                    if keyword.lower() in i["item_en"].lower() or
-                       keyword.lower() in i["item_jp"].lower()
-                ]
+            items = section["items"] if section_match else [
+                i for i in section["items"]
+                if keyword.lower() in i["item_en"].lower() or keyword.lower() in i["item_jp"].lower()
+            ]
         else:
             items = section["items"]
 
@@ -314,30 +262,23 @@ async def send_grouped_results(update, title, keywords=None, keyword=None):
             continue
 
         found_any = True
-
-        msg = f"📋 {section['section']}\n"
-        msg += "─" * 30 + "\n"
+        msg = f"📋 {section['section']}\n{'─' * 30}\n"
         for i in items:
-            msg += f"• {i['item_en']}\n"
-            msg += f"  ({i['item_jp']})\n"
-            msg += f"  {format_price(i['price'], sgd_rate)}\n\n"
+            msg += f"• {i['item_en']}\n  ({i['item_jp']})\n  {format_price(i['price'], sgd_rate)}\n\n"
 
-        if len(msg) > 4096:
-            for x in range(0, len(msg), 4096):
-                await update.message.reply_text(msg[x:x+4096])
-        else:
-            await update.message.reply_text(msg)
+        for chunk in range(0, len(msg), 4096):
+            await update.message.reply_text(msg[chunk:chunk + 4096])
 
     if not found_any:
         await update.message.reply_text(f"❌ No items found for '{title}'")
 
-# ─── /newarrival command ────────────────────────────────────────────
+
+# ─── Command handlers ────────────────────────────────────────────────
 async def cmd_newarrival(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🆕 Fetching new arrivals... please wait")
 
-    rates = get_rates(base="JPY")
-    sgd_rate = rates.get("SGD", None)
-
+    rates    = get_rates(base="JPY")
+    sgd_rate = rates.get("SGD")
     items, update_date = get_new_arrivals()
 
     if not items:
@@ -347,27 +288,19 @@ async def cmd_newarrival(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🆕 {update_date}\n{'─' * 30}")
 
     for idx, i in enumerate(items, 1):
-        price_line = format_price(i["price"], sgd_rate)
-
-        # Show reserved/exclusive sale status
-        if i["is_reserved"]:
-            status = "🔒 Reserved/Exclusive Sale"
-        else:
-            status = "✅ Available"
-
+        status  = "🔒 Reserved/Exclusive Sale" if i["is_reserved"] else "✅ Available"
         caption = (
             f"{idx}. {i['name_en']}\n"
             f"({i['name_jp']})\n"
-            f"{price_line}\n"
+            f"{format_price(i['price'], sgd_rate)}\n"
             f"{status}"
         )
-
         if i.get("img_url"):
             try:
                 await context.bot.send_photo(
                     chat_id=update.effective_chat.id,
                     photo=i["img_url"],
-                    caption=caption
+                    caption=caption,
                 )
             except Exception as e:
                 print(f"Photo failed: {e}")
@@ -375,43 +308,39 @@ async def cmd_newarrival(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(caption)
 
-        import asyncio
         await asyncio.sleep(0.5)
 
-# ─── /debug command ─────────────────────────────────────────────────
+
 async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Testing scraper...")
     try:
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
+        scraper = make_scraper()
         scraper.get("https://www.eaglecapitalone.com/", timeout=15)
         time.sleep(2)
 
-        url = "https://www.eaglecapitalone.com/goros-kaitorikakakuhyo/"
+        url      = "https://www.eaglecapitalone.com/goros-kaitorikakakuhyo/"
         response = scraper.get(url, timeout=20)
-        soup = BeautifulSoup(response.text, "html.parser")
-        tables = soup.find_all("table")
+        soup     = BeautifulSoup(response.text, "html.parser")
+        tables   = soup.find_all("table")
         headings = soup.find_all(["h1", "h2", "h3", "h4"])
 
-        msg = f"✅ Page loaded: {response.status_code}\n"
-        msg += f"📊 Tables found: {len(tables)}\n"
-        msg += f"📝 Headings found: {len(headings)}\n\n"
-
+        msg = (
+            f"✅ Page loaded: {response.status_code}\n"
+            f"📊 Tables found: {len(tables)}\n"
+            f"📝 Headings found: {len(headings)}\n"
+        )
         if response.status_code == 429:
             msg += "⚠️ Still rate limited\n"
         elif response.status_code == 200:
             msg += "✅ Connection successful!\n"
-
         if headings:
-            msg += f"First heading: {headings[0].get_text(strip=True)}\n"
+            msg += f"\nFirst heading: {headings[0].get_text(strip=True)}"
         if tables:
             first_rows = tables[0].find_all("tr")
             if first_rows:
                 cols = first_rows[0].find_all("td")
                 if cols:
-                    msg += f"First table row: {cols[0].get_text(strip=True)}"
-
+                    msg += f"\nFirst table row: {cols[0].get_text(strip=True)}"
         if price_cache["data"]:
             age = int((time.time() - price_cache["timestamp"]) / 60)
             msg += f"\n\n💾 Cache: {len(price_cache['data'])} sections, {age} min old"
@@ -422,14 +351,14 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
-# ─── /C command ─────────────────────────────────────────────────────
-async def convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    amount = 1
-    from_currency = "SGD"
-    to_currency = "SGD"
-    args = context.args
 
-    if len(args) >= 1:
+async def convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args          = context.args
+    amount        = 1.0
+    from_currency = "SGD"
+    to_currency   = "SGD"
+
+    if args:
         try:
             amount = float(args[0])
             if len(args) >= 2:
@@ -440,7 +369,6 @@ async def convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
             from_currency = args[0].upper()
             if len(args) >= 2:
                 to_currency = args[1].upper()
-            amount = 1
 
     rates = get_rates(base=from_currency)
     if not rates:
@@ -455,30 +383,23 @@ async def convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💱 {amount:.2f} {from_currency} ≈ {converted:.2f} {to_currency}\n⚠️ Approximate exchange rate"
     )
 
-# ─── /list command ──────────────────────────────────────────────────
+
 async def list_currencies(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rates = get_rates("SGD")
     if not rates:
         await update.message.reply_text("❌ Unable to fetch currency list.")
         return
 
-    lines = []
-    for cur in sorted(rates.keys()):
-        if cur in CURRENCY_COUNTRY and cur in CURRENCY_FLAG:
-            rate = rates[cur]
-            line = (
-                f"{CURRENCY_FLAG[cur]} "
-                f"{cur:<3} – {CURRENCY_COUNTRY[cur]:<15} | "
-                f"1 SGD = {rate:>6.2f}"
-            )
-            lines.append(line)
-
-    message = "💱 Exchange Rates\n\n"
-    message += "\n".join(lines) + "\n"
-    message += "\nUsage:\n/C 100 SGD JPY\n{Convert 'Amount' 'From' 'To'}"
+    lines = [
+        f"{CURRENCY_FLAG[cur]} {cur:<3} – {CURRENCY_COUNTRY[cur]:<15} | 1 SGD = {rates[cur]:>6.2f}"
+        for cur in sorted(rates.keys())
+        if cur in CURRENCY_COUNTRY and cur in CURRENCY_FLAG
+    ]
+    message = "💱 Exchange Rates\n\n" + "\n".join(lines)
+    message += "\n\nUsage:\n/C 100 SGD JPY\n{Convert 'Amount' 'From' 'To'}"
     await update.message.reply_text(message)
 
-# ─── /price command ─────────────────────────────────────────────────
+
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyword = " ".join(context.args).strip()
     if not keyword:
@@ -490,56 +411,13 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if is_japanese(keyword):
-        translated_keyword = translate_to_english(keyword)
-        print(f"Search: '{keyword}' → translated: '{translated_keyword}'")
-        await send_grouped_results(update, keyword, keywords=[keyword, translated_keyword])
+        translated = translate_to_english(keyword)
+        print(f"Search: '{keyword}' → '{translated}'")
+        await send_grouped_results(update, keyword, keywords=[keyword, translated])
     else:
         await send_grouped_results(update, keyword, keyword=keyword)
 
-# ─── Category commands ──────────────────────────────────────────────
-async def cmd_feather(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_grouped_results(update, "Feather", CATEGORY_KEYWORDS["feather"])
 
-async def cmd_largefeather(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_grouped_results(update, "Extra Large Feather", CATEGORY_KEYWORDS["largefeather"])
-
-async def cmd_wheel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_grouped_results(update, "Wheel", CATEGORY_KEYWORDS["wheel"])
-
-async def cmd_hook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_grouped_results(update, "Hook", CATEGORY_KEYWORDS["hook"])
-
-async def cmd_sunmetal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_grouped_results(update, "Sun Metal", CATEGORY_KEYWORDS["sunmetal"])
-
-async def cmd_eagle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_grouped_results(update, "Eagle", CATEGORY_KEYWORDS["eagle"])
-
-async def cmd_ring(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_grouped_results(update, "Ring", CATEGORY_KEYWORDS["ring"])
-
-async def cmd_brace(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_grouped_results(update, "Bracelet", CATEGORY_KEYWORDS["brace"])
-
-async def cmd_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_grouped_results(update, "Chain", CATEGORY_KEYWORDS["chain"])
-
-async def cmd_metal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_grouped_results(update, "Metal", CATEGORY_KEYWORDS["metal"])
-
-async def cmd_cross(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_grouped_results(update, "Cross", CATEGORY_KEYWORDS["cross"])
-
-async def cmd_belt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_grouped_results(update, "Belt", CATEGORY_KEYWORDS["belt"])
-
-async def cmd_concho(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_grouped_results(update, "Concho", CATEGORY_KEYWORDS["concho"])
-
-async def cmd_gold(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await send_grouped_results(update, "Gold", CATEGORY_KEYWORDS["gold"])
-
-# ─── /menu command ──────────────────────────────────────────────────
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "📋 Available Commands:\n\n"
@@ -569,64 +447,50 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg)
 
-# ─── Bot setup ──────────────────────────────────────────────────────
-app = ApplicationBuilder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("C", convert))
-app.add_handler(CommandHandler("list", list_currencies))
-app.add_handler(CommandHandler("price", price))
-app.add_handler(CommandHandler("menu", menu))
-app.add_handler(CommandHandler("newarrival", cmd_newarrival))
-app.add_handler(CommandHandler("debug", cmd_debug))
-app.add_handler(CommandHandler("feather", cmd_feather))
-app.add_handler(CommandHandler("largefeather", cmd_largefeather))
-app.add_handler(CommandHandler("wheel", cmd_wheel))
-app.add_handler(CommandHandler("hook", cmd_hook))
-app.add_handler(CommandHandler("sunmetal", cmd_sunmetal))
-app.add_handler(CommandHandler("eagle", cmd_eagle))
-app.add_handler(CommandHandler("ring", cmd_ring))
-app.add_handler(CommandHandler("brace", cmd_brace))
-app.add_handler(CommandHandler("chain", cmd_chain))
-app.add_handler(CommandHandler("metal", cmd_metal))
-app.add_handler(CommandHandler("cross", cmd_cross))
-app.add_handler(CommandHandler("belt", cmd_belt))
-app.add_handler(CommandHandler("concho", cmd_concho))
-app.add_handler(CommandHandler("gold", cmd_gold))
 
-import asyncio
+# Category command factory — avoids 14 near-identical functions
+def make_category_cmd(display_name, keywords_key):
+    async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await send_grouped_results(update, display_name, CATEGORY_KEYWORDS[keywords_key])
+    return handler
 
+
+# ─── Main ────────────────────────────────────────────────────────────
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # handlers
-    app.add_handler(CommandHandler("C", convert))
-    app.add_handler(CommandHandler("list", list_currencies))
-    app.add_handler(CommandHandler("price", price))
-    app.add_handler(CommandHandler("menu", menu))
-    app.add_handler(CommandHandler("newarrival", cmd_newarrival))
-    app.add_handler(CommandHandler("debug", cmd_debug))
-    app.add_handler(CommandHandler("feather", cmd_feather))
-    app.add_handler(CommandHandler("largefeather", cmd_largefeather))
-    app.add_handler(CommandHandler("wheel", cmd_wheel))
-    app.add_handler(CommandHandler("hook", cmd_hook))
-    app.add_handler(CommandHandler("sunmetal", cmd_sunmetal))
-    app.add_handler(CommandHandler("eagle", cmd_eagle))
-    app.add_handler(CommandHandler("ring", cmd_ring))
-    app.add_handler(CommandHandler("brace", cmd_brace))
-    app.add_handler(CommandHandler("chain", cmd_chain))
-    app.add_handler(CommandHandler("metal", cmd_metal))
-    app.add_handler(CommandHandler("cross", cmd_cross))
-    app.add_handler(CommandHandler("belt", cmd_belt))
-    app.add_handler(CommandHandler("concho", cmd_concho))
-    app.add_handler(CommandHandler("gold", cmd_gold))
+    app.add_handler(CommandHandler("C",            convert))
+    app.add_handler(CommandHandler("list",          list_currencies))
+    app.add_handler(CommandHandler("price",         price))
+    app.add_handler(CommandHandler("menu",          menu))
+    app.add_handler(CommandHandler("newarrival",    cmd_newarrival))
+    app.add_handler(CommandHandler("debug",         cmd_debug))
+
+    categories = [
+        ("feather",      "Feather"),
+        ("largefeather", "Extra Large Feather"),
+        ("wheel",        "Wheel"),
+        ("hook",         "Hook"),
+        ("sunmetal",     "Sun Metal"),
+        ("eagle",        "Eagle"),
+        ("ring",         "Ring"),
+        ("brace",        "Bracelet"),
+        ("chain",        "Chain"),
+        ("metal",        "Metal"),
+        ("cross",        "Cross"),
+        ("belt",         "Belt"),
+        ("concho",       "Concho"),
+        ("gold",         "Gold"),
+    ]
+    for key, label in categories:
+        app.add_handler(CommandHandler(key, make_category_cmd(label, key)))
 
     print("Bot started...")
-
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
+    await asyncio.Event().wait()   # run forever
 
-    # keep running forever
-    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
