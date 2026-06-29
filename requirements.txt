@@ -1,0 +1,6 @@
+python-telegram-bot==21.6
+cloudscraper
+beautifulsoup4
+requests
+deep-translator
+lxml
