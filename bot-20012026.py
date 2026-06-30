@@ -11,10 +11,13 @@ from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from datetime import time as dtime
+import pytz
 
 # ─── Constants ──────────────────────────────────────────────────────
 BOT_TOKEN = "8517153660:AAExRG-RKm2SeeZ7xF7JTp8dBWwc0jOYh4U"
 SOLD_HISTORY_FILE = "sold_history.json"
+
 
 CURRENCY_COUNTRY = {
     "SGD": "Singapore",       "JPY": "Japan",          "CNY": "China",
@@ -72,6 +75,7 @@ price_cache = {"data": None, "timestamp": 0}
 CACHE_DURATION = 3600
 translation_cache = {}
 
+last_known_update = {"date": ""}
 
 # ─── Sold History ───────────────────────────────────────────────────
 def load_sold_history():
@@ -261,7 +265,7 @@ def check_item_availability(scraper, product_url):
 
 
 # ─── Scrape sold items from category page ──────────────────────────
-def scrape_sold_from_category(category_key, keywords, min_matches=2):
+def scrape_sold_from_category(category_key, keywords, min_matches=2, max_soldout=20):
     url = CATEGORY_URLS.get(category_key)
     if not url:
         return []
@@ -277,7 +281,11 @@ def scrape_sold_from_category(category_key, keywords, min_matches=2):
         soldout_positions = [m.start() for m in re.finditer(r'soldout', html, re.IGNORECASE)]
         print(f"Found {len(soldout_positions)} soldout occurrences")
 
-        for pos in soldout_positions:
+        # ── Only check last max_soldout soldout items (most recent) ──
+        recent_positions = soldout_positions[-max_soldout:]
+        print(f"Checking last {len(recent_positions)} soldout items only")
+
+        for pos in recent_positions:
             chunk = html[max(0, pos - 3000):pos]
 
             price_matches = re.findall(r'[￥¥][\d,]+', chunk)
@@ -296,7 +304,6 @@ def scrape_sold_from_category(category_key, keywords, min_matches=2):
             if not name_jp or not price_str:
                 continue
 
-            # Extract version from image URL
             version_matches = re.findall(r'version/(\d+)/', chunk)
             version = int(version_matches[-1]) if version_matches else 0
 
@@ -306,7 +313,7 @@ def scrape_sold_from_category(category_key, keywords, min_matches=2):
             match_count = sum(1 for kw in keywords if kw.lower() in name_combined)
 
             if match_count >= min_matches:
-                print(f"✅ MATCHED ({match_count}/{min_matches} kw, v={version}): {name_jp} @ {price_str}")
+                print(f"✅ MATCHED ({match_count}/{min_matches}): {name_jp} @ {price_str}")
                 if not any(s["name_jp"] == name_jp for s in sold_items):
                     sold_items.append({
                         "name_jp": name_jp,
@@ -315,7 +322,7 @@ def scrape_sold_from_category(category_key, keywords, min_matches=2):
                         "version": version,
                     })
             else:
-                print(f"❌ Only {match_count}/{min_matches} matches: {name_jp}")
+                print(f"❌ {match_count}/{min_matches}: {name_jp}")
 
         # Sort by version descending (latest first)
         sold_items.sort(key=lambda x: x["version"], reverse=True)
@@ -327,42 +334,96 @@ def scrape_sold_from_category(category_key, keywords, min_matches=2):
         print(f"Error scraping category: {e}")
         return []
 
+def check_price_margin(current_price_str, similar_items, threshold_percent=10, always_show=False):
+    """
+    For IN STOCK items — compares asking price against similar SOLD items.
+    Shows if it's a good deal (below market) or overpriced (above market).
+    """
+    current_price = parse_price_number(current_price_str)
+    if current_price is None or not similar_items:
+        return None
 
+    similar_prices = [
+        parse_price_number(s["price"])
+        for s in similar_items
+        if parse_price_number(s["price"]) is not None
+    ]
+
+    if not similar_prices:
+        return None
+
+    avg_similar = sum(similar_prices) / len(similar_prices)
+    if avg_similar == 0:
+        return None
+
+    percent_diff = ((current_price - avg_similar) / avg_similar) * 100
+
+    if not always_show and abs(percent_diff) < threshold_percent:
+        return None
+
+    if percent_diff > 0:
+        return f"⚠️ Asking price {percent_diff:.1f}% ABOVE market avg (¥{avg_similar:,.0f})"
+    elif percent_diff < 0:
+        return f"💰 Asking price {abs(percent_diff):.1f}% BELOW market avg (¥{avg_similar:,.0f}) — good deal!"
+    else:
+        return f"➡️ Asking price matches market avg (¥{avg_similar:,.0f})"
 # ─── Get similar sold prices from website ──────────────────────────
 def get_similar_sold_prices(name_en, name_jp, max_results=3):
     category_key = detect_category(name_en, name_jp)
     if not category_key:
         return []
 
-    # ── Extract Japanese base name (remove brackets) ──
     jp_base = re.sub(r'【.*?】', '', name_jp).strip()
 
-    # ── If we have a specific Japanese base, use it as PRIMARY keyword ──
-    # This ensures ハートホイールフェザー小 only matches heart wheel feather items
-    if jp_base:
-        # Use full jp_base as ONE keyword — must contain this exact string
-        keywords = [jp_base]
-        min_matches = 1  # only need 1 match but it must be the full jp_base
-        print(f"Category: {category_key}, Primary JP keyword: '{jp_base}'")
-        sold_items = scrape_sold_from_category(category_key, keywords, min_matches=min_matches)
+    stop_words = {
+        'the', 'and', 'for', 'with', 'on', 'at', 'in', 'of', 'a', 'an',
+        'current', 'latest', 'cast', 'old', 'new', 'good', 'condition',
+        'product', 'excellent', 'very', 'rare', 'individual', 'diameter',
+        'model', 'size', 'weight', 'right', 'left', 'no', 'super',
+        'hobo', 'mint', 'almost', 'barely', 'thick'
+    }
 
-        # If no results with exact JP base, try English keywords as fallback
-        if not sold_items:
-            stop_words = {
-                'the', 'and', 'for', 'with', 'on', 'at', 'in', 'of', 'a', 'an',
-                'current', 'latest', 'cast', 'old', 'new', 'good', 'condition',
-                'product', 'excellent', 'very', 'rare', 'individual', 'diameter',
-                'model', 'size', 'weight', 'right', 'left', 'no', 'super',
-                'hobo', 'mint', 'almost', 'barely'
-            }
-            en_base = re.sub(r'\[.*?\]', '', name_en).strip().lower()
-            en_words = [w for w in en_base.split() if len(w) >= 3 and w not in stop_words]
-            if en_words:
-                print(f"Fallback EN keywords: {en_words}")
-                sold_items = scrape_sold_from_category(category_key, en_words, min_matches=2)
+    en_base = re.sub(r'\[.*?\]', '', name_en).strip().lower()
+    en_words = [w for w in en_base.split() if len(w) >= 2 and w not in stop_words]
+
+    # Plain feather
+    if "プレーンフェザー" in name_jp or "plain feather" in en_base:
+        keywords = ["プレーンフェザー", "plain", "feather"]
+        min_matches = 2
+
+    # Gold tip feather — ONLY 先金 (kamigane/上金 is a different style)
+    elif "先金" in name_jp:
+        keywords = ["先金特大フェザー"]
+        min_matches = 1
+        print(f"Category: {category_key}, Gold-tip keywords (先金 only): {keywords}")
+        sold_items = scrape_sold_from_category(
+            category_key, keywords, min_matches=min_matches, max_soldout=20
+        )
+        sold_items = [
+            s for s in sold_items
+            if "縄" not in s["name_jp"] and "ターコイズ" not in s["name_jp"]
+            and "上金" not in s["name_jp"]
+        ]
+        return sold_items[:max_results]
+
+    # Heart wheel feather
+    elif "ハートホイールフェザー" in name_jp:
+        keywords = ["ハートホイールフェザー"]
+        min_matches = 1
+
+    # Hook wheel chain — eagle hook + wheel chain combos
+    elif category_key == "hook":
+        keywords = ["イーグルフック", "ホイールチェーン", "太角", "フックホイール"]
+        min_matches = 1
+
     else:
-        return []
+        keywords = [jp_base] if jp_base else en_words
+        min_matches = 1 if jp_base else 2
 
+    print(f"Category: {category_key}, Keywords: {keywords}, Min: {min_matches}")
+    sold_items = scrape_sold_from_category(
+        category_key, keywords, min_matches=min_matches, max_soldout=20
+    )
     return sold_items[:max_results]
 
 # ─── Scrape Goro's price list ───────────────────────────────────────
@@ -493,7 +554,81 @@ def get_new_arrivals():
     except Exception as e:
         print(f"New arrivals error: {e}")
         return [], ""
+# ─── Price trend analysis ───────────────────────────────────────────
+def parse_price_number(price_str):
+    """Convert '￥380,000' to 380000.0"""
+    try:
+        return float(price_str.replace("￥", "").replace("¥", "").replace(",", "").strip())
+    except:
+        return None
+def check_price_trend_vs_similar(current_price_str, similar_items, threshold_percent=15, always_show=False):
+    """
+    Compares current sold price against the average of similar sold items from the website.
+    """
+    current_price = parse_price_number(current_price_str)
+    if current_price is None or not similar_items:
+        return None
 
+    similar_prices = [
+        parse_price_number(s["price"])
+        for s in similar_items
+        if parse_price_number(s["price"]) is not None
+    ]
+
+    if not similar_prices:
+        return None
+
+    avg_similar = sum(similar_prices) / len(similar_prices)
+    if avg_similar == 0:
+        return None
+
+    percent_change = ((current_price - avg_similar) / avg_similar) * 100
+
+    if not always_show and abs(percent_change) < threshold_percent:
+        return None
+
+    if percent_change > 0:
+        return f"📈 Price UP {percent_change:.1f}% vs similar avg (¥{avg_similar:,.0f})"
+    elif percent_change < 0:
+        return f"📉 Price DOWN {abs(percent_change):.1f}% vs similar avg (¥{avg_similar:,.0f})"
+    else:
+        return f"➡️ Price UNCHANGED vs similar avg (¥{avg_similar:,.0f})"
+
+def check_price_trend(name_en, current_price_str, threshold_percent=15, always_show=False):
+    history = load_sold_history()
+    key = name_en[:40].lower().strip()
+
+    if key not in history or not history[key]:
+        return None
+
+    current_price = parse_price_number(current_price_str)
+    if current_price is None:
+        return None
+
+    previous_prices = [
+        parse_price_number(r["price"])
+        for r in history[key][1:]
+        if parse_price_number(r["price"]) is not None
+    ]
+
+    if not previous_prices:
+        return None
+
+    avg_previous = sum(previous_prices) / len(previous_prices)
+    if avg_previous == 0:
+        return None
+
+    percent_change = ((current_price - avg_previous) / avg_previous) * 100
+
+    if not always_show and abs(percent_change) < threshold_percent:
+        return None
+
+    if percent_change > 0:
+        return f"📈 Price UP {percent_change:.1f}% vs avg (¥{avg_previous:,.0f})"
+    elif percent_change < 0:
+        return f"📉 Price DOWN {abs(percent_change):.1f}% vs avg (¥{avg_previous:,.0f})"
+    else:
+        return f"➡️ Price UNCHANGED vs avg (¥{avg_previous:,.0f})"
 
 # ─── Shared search helper ───────────────────────────────────────────
 async def send_grouped_results(update, title, keywords=None, keyword=None):
@@ -533,7 +668,50 @@ async def send_grouped_results(update, title, keywords=None, keyword=None):
 
     if not found_any:
         await update.message.reply_text(f"❌ No items found for '{title}'")
+        
+async def auto_check_new_arrivals(context):
+    print("Auto-checking new arrivals...")
+    try:
+        scraper = make_scraper()
+        response = scraper.get("https://www.eaglecapitalone.com/", timeout=20)
+        if response.status_code != 200:
+            return
 
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Find new arrivals heading
+        update_date = ""
+        for h in soup.find_all(["h1", "h2", "h3", "h4"]):
+            text = h.get_text(strip=True)
+            if "新着" in text and "入荷" not in text:
+                update_date = translate_to_english(text)
+                break
+
+        if not update_date:
+            return
+
+        print(f"Current update: {update_date}")
+        print(f"Last known: {last_known_update['date']}")
+
+        # ── If date has changed — send notification ──
+        if update_date != last_known_update["date"] and last_known_update["date"] != "":
+            print(f"🆕 New arrivals detected: {update_date}")
+
+            # Send notification to your chat
+            await context.bot.send_message(
+                chat_id=context.job.chat_id,
+                text=(
+                    f"🔔 New arrivals posted!\n"
+                    f"📅 {update_date}\n\n"
+                    f"Type /new to see the latest items with prices and availability."
+                )
+            )
+
+        # Update last known date
+        last_known_update["date"] = update_date
+
+    except Exception as e:
+        print(f"Auto-check error: {e}")
 
 # ─── /new command (new arrivals) ────────────────────────────────────
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -559,38 +737,48 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price_line = format_price(i["price"], sgd_rate)
 
         if i.get("is_reserved"):
-            availability  = "🔒 Reserved/Exclusive Sale"
+            availability     = "🔒 Reserved/Exclusive Sale"
             previous_history = []
-            site_sold     = []
+            site_sold        = []
+            trend_alert      = None
+            margin_alert     = None
 
         elif i.get("product_url"):
-            # ── Get previous history BEFORE checking ──
             previous_history = get_sold_history_list(i["name_en"])
 
-            # ── Check availability ──
             availability = check_item_availability(scraper, i["product_url"])
             time.sleep(1)
 
-            # ── Record if sold out ──
             if availability == "❌ Sold Out":
                 sold_date = datetime.now().strftime("%Y-%m-%d %H:%M")
-                record_sold_price(
-                    i["name_en"],
-                    i["name_jp"],
-                    i["price"],
-                    sold_date
-                )
+                record_sold_price(i["name_en"], i["name_jp"], i["price"], sold_date)
 
-            # ── Get similar sold prices from website (latest first) ──
             site_sold = get_similar_sold_prices(i["name_en"], i["name_jp"])
             time.sleep(1)
+
+            trend_alert  = None
+            margin_alert = None
+
+            if availability == "❌ Sold Out" and site_sold:
+                trend_alert = check_price_trend_vs_similar(
+                    i["price"], site_sold,
+                    threshold_percent=15,
+                    always_show=True
+                )
+            elif availability == "✅ In Stock" and site_sold:
+                margin_alert = check_price_margin(
+                    i["price"], site_sold,
+                    threshold_percent=10,
+                    always_show=True
+                )
 
         else:
             availability     = "❓ Unknown"
             previous_history = []
             site_sold        = []
+            trend_alert      = None
+            margin_alert     = None
 
-        # ── Build caption ──
         caption = (
             f"{idx}. {i['name_en']}\n"
             f"({i['name_jp']})\n"
@@ -598,20 +786,23 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{availability}"
         )
 
-        # ── Show similar sold prices from website sorted latest first ──
+        if trend_alert:
+            caption += f"\n\n{trend_alert}"
+
+        if margin_alert:
+            caption += f"\n\n{margin_alert}"
+
         if site_sold:
             caption += "\n\n📊 Similar sold on site (latest first):"
             for s in site_sold:
                 caption += f"\n  • {s['name_en']}"
                 caption += f"\n    {format_price(s['price'], sgd_rate)}"
 
-        # ── Show bot's own previous history ──
         if availability == "❌ Sold Out" and previous_history:
             caption += "\n\n🕐 Previously recorded:"
             for record in previous_history[:3]:
                 caption += f"\n  • {record['price']} on {record['sold_date']}"
 
-        # ── Send photo or text ──
         if i.get("img_url"):
             try:
                 await context.bot.send_photo(
@@ -627,7 +818,61 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         time.sleep(0.5)
 
+async def cmd_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
 
+    # Remove existing jobs
+    current_jobs = context.job_queue.get_jobs_by_name(str(chat_id))
+    for job in current_jobs:
+        job.schedule_removal()
+
+    sgt = pytz.timezone("Asia/Singapore")
+
+    # ── Schedule checks every 30 mins between 6pm-8pm SGT ──
+    check_times = [
+        dtime(18, 0,  tzinfo=sgt),   # 6:00 PM SGT
+        dtime(18, 30, tzinfo=sgt),   # 6:30 PM SGT
+        dtime(19, 0,  tzinfo=sgt),   # 7:00 PM SGT
+        dtime(19, 30, tzinfo=sgt),   # 7:30 PM SGT
+        dtime(20, 0,  tzinfo=sgt),   # 8:00 PM SGT
+    ]
+
+    for check_time in check_times:
+        context.job_queue.run_daily(
+            auto_check_new_arrivals,
+            time=check_time,
+            chat_id=chat_id,
+            name=f"{chat_id}_{check_time.hour}_{check_time.minute}"
+        )
+
+    await update.message.reply_text(
+        "✅ Notifications enabled!\n"
+        "🕕 I will check for new arrivals at:\n"
+        "  • 6:00 PM SGT\n"
+        "  • 6:30 PM SGT\n"
+        "  • 7:00 PM SGT\n"
+        "  • 7:30 PM SGT\n"
+        "  • 8:00 PM SGT\n\n"
+        "You will be alerted when the website updates with new arrivals.\n"
+        "Type /notifyoff to disable."
+    )
+
+async def cmd_notifyoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+
+    # Remove all jobs for this chat
+    removed = 0
+    check_times = [(18,0), (18,30), (19,0), (19,30), (20,0)]
+    for hour, minute in check_times:
+        jobs = context.job_queue.get_jobs_by_name(f"{chat_id}_{hour}_{minute}")
+        for job in jobs:
+            job.schedule_removal()
+            removed += 1
+
+    if removed == 0:
+        await update.message.reply_text("⚠️ No active notifications to disable.")
+    else:
+        await update.message.reply_text("🔕 Notifications disabled.")
 # ─── /soldhistory command ───────────────────────────────────────────
 async def cmd_soldhistory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyword = " ".join(context.args).strip()
@@ -856,6 +1101,9 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/gold — Gold items\n\n"
         "🔧 Debug:\n"
         "/debug — Test scraper connection\n"
+        "🔔 Notifications:\n"
+        "/notify — Auto alert when new arrivals posted\n"
+        "/notifyoff — Disable notifications\n\n"
     )
     await update.message.reply_text(msg)
 
@@ -879,6 +1127,8 @@ async def main():
     app.add_handler(CommandHandler("soldhistory", cmd_soldhistory))
     app.add_handler(CommandHandler("soldonsite",  cmd_soldonsite))
     app.add_handler(CommandHandler("debug",       cmd_debug))
+    app.add_handler(CommandHandler("notify",    cmd_notify))
+    app.add_handler(CommandHandler("notifyoff", cmd_notifyoff))
 
     categories = [
         ("feather",      "Feather"),
