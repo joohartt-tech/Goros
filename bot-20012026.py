@@ -13,6 +13,12 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from datetime import time as dtime
 import pytz
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import os
+
+
+
 
 # ─── Constants ──────────────────────────────────────────────────────
 BOT_TOKEN = "8517153660:AAExRG-RKm2SeeZ7xF7JTp8dBWwc0jOYh4U"
@@ -76,7 +82,20 @@ CACHE_DURATION = 3600
 translation_cache = {}
 
 last_known_update = {"date": ""}
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+    def log_message(self, format, *args):
+        pass  # suppress noisy logs
 
+def run_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+    threading.Thread(target=run_dummy_server, daemon=True).start()
 # ─── Sold History ───────────────────────────────────────────────────
 def load_sold_history():
     if os.path.exists(SOLD_HISTORY_FILE):
