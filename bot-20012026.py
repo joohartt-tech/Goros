@@ -98,7 +98,7 @@ CATEGORY_KEYWORDS = {
 
 ECO_CATEGORY_URLS = {
     "wheel":        "https://www.eaglecapitalone.com/購入/ホイール/",
-    "feather":      "https://www.eaglecapitalone.com/購入/新品特大フェザー/",
+    "feather":      "https://www.eaglecapitalone.com/ショップ/",
     "heartfeather": "https://www.eaglecapitalone.com/購入/ハートホイールフェザー/",
     "plainfeather": "https://www.eaglecapitalone.com/その他フェザー/",
     "usedfeather":  "https://www.eaglecapitalone.com/ショップ/",
@@ -128,6 +128,9 @@ RINKAN_CATEGORY_URLS = {
     "wallet":       "https://www.rinkan-goros.com/category/220900",
     "bag":          "https://www.rinkan-goros.com/category/220900",
     "metal":        "https://www.rinkan-goros.com/category/110600",
+    "wheel":        "https://www.rinkan-goros.com/category/111100",
+    "eagle":        "https://www.rinkan-goros.com/category/110100",
+    "allgold":      "https://www.rinkan-goros.com/category/440000",
 }
 
 DELTAONE_CATEGORY_URLS = {
@@ -400,6 +403,74 @@ def detect_category(name_en, name_jp):
     if "ベルト" in name_jp or "belt" in name_lower: return "belt"
     return None
 
+def extract_rinkan_tags(name_jp, name_en):
+    """Extract grade, fitting-style, and facing-direction tags so comps only
+    compare items that are actually the same category of product."""
+    combined_en = name_en.lower()
+    tags = set()
+
+    # Condition / rarity tier
+    if "新品" in name_jp or re.search(r'\[new\]|\bnew\b', combined_en):
+        tags.add("new")
+    if "希少" in name_jp or "レア" in name_jp or "rare" in combined_en:
+        tags.add("rare")
+    if ("オールド" in name_jp or "old" in combined_en) and "gold" not in combined_en:
+        tags.add("old")
+    if "中古" in name_jp or re.search(r'\bused\b', combined_en):
+        tags.add("used")
+
+    # Fitting/mounting style — the primary category split for feathers:
+    # plain / turquoise rope / kamigane / kamigane+turquoise / tip
+    has_turquoise = "ターコイズ" in name_jp or "turquoise" in combined_en
+    has_rope = (
+        "縄" in name_jp or "ロープ" in name_jp
+        or "rope" in combined_en or "kanawa" in combined_en
+    )
+    has_kamigane = "上金" in name_jp or "上銀" in name_jp or "upper gold" in combined_en or "upper silver" in combined_en
+    has_tip = "先金" in name_jp or "先銀" in name_jp or "tip gold" in combined_en or "tip silver" in combined_en
+    has_plain = "プレーン" in name_jp or "plain" in combined_en
+
+    if has_tip:
+        tags.add("fit_tip")
+    elif has_rope and has_turquoise:
+        tags.add("fit_turquoise_rope")
+    elif has_kamigane and has_turquoise:
+        tags.add("fit_kamigane_turquoise")
+    elif has_kamigane:
+        tags.add("fit_kamigane")
+    elif has_turquoise:
+        tags.add("fit_turquoise_rope")
+    elif has_plain:
+        tags.add("fit_plain")
+
+    # Facing direction
+    if "左向き" in name_jp or "left-facing" in combined_en or "facing left" in combined_en:
+        tags.add("face_left")
+    elif "右向き" in name_jp or "right-facing" in combined_en or "facing right" in combined_en:
+        tags.add("face_right")
+
+    # Fitting metal material — kept for display only, not enforced as a hard match
+    if "上銀" in name_jp or "upper silver" in combined_en:
+        tags.add("upper_silver")
+    if "上金" in name_jp or "upper gold" in combined_en:
+        tags.add("upper_gold")
+
+    return tags
+
+
+GRADE_TAGS = {"new", "rare", "old", "used"}
+FITTING_STYLE_TAGS = {"fit_plain", "fit_turquoise_rope", "fit_kamigane", "fit_kamigane_turquoise", "fit_tip"}
+FACING_TAGS = {"face_left", "face_right"}
+
+def tags_compatible(tags_a, tags_b):
+    """Require matching grade, fitting style, and facing direction whenever
+    either item declares that attribute (undeclared attributes don't block a match)."""
+    for tag_group in (GRADE_TAGS, FITTING_STYLE_TAGS, FACING_TAGS):
+        a, b = tags_a & tag_group, tags_b & tag_group
+        if a and b and not (a & b):
+            return False
+    return True
+
 def check_item_availability(scraper, product_url):
     try:
         product_url = product_url.replace("//app", "/app")
@@ -415,38 +486,69 @@ def check_item_availability(scraper, product_url):
 
 def scrape_sold_from_category(category_key, keywords, min_matches=2, max_soldout=20):
     url = ECO_CATEGORY_URLS.get(category_key)
-    if not url: return []
+    if not url:
+        return []
     try:
         scraper = make_scraper()
         response = scraper.get(url, timeout=20)
-        if response.status_code != 200: return []
+        if response.status_code != 200:
+            return []
         html = response.text
         sold_items = []
-        for pos in [m.start() for m in re.finditer(r'soldout', html, re.IGNORECASE)][-max_soldout:]:
-            chunk = html[max(0, pos - 3000):pos]
-            prices = re.findall(r'[￥¥][\d,]+', chunk)
-            if not prices: continue
-            price_str = prices[-1]
-            name_jp = ""
-            for m in reversed(re.findall(r'<strong>(.*?)</strong>', chunk, re.DOTALL)):
-                clean = re.sub(r'<.*?>', '', m).strip()
-                if clean and '￥' not in clean and '¥' not in clean and len(clean) > 2:
-                    name_jp = clean; break
-            if not name_jp: continue
-            ver_match = re.findall(r'version/(\d+)/', chunk)
-            version = int(ver_match[-1]) if ver_match else 0
+
+        main_imgs = [mm.group(1) for mm in re.finditer(r'src="([^"]+)"\s+itemprop="image"', html)]
+
+        strongs = list(re.finditer(r'<strong>(.*?)</strong>', html, re.DOTALL))
+        img_idx = 0
+        for m in strongs:
+            clean = re.sub(r'<.*?>', '', m.group(1)).strip()
+            if not clean or '￥' in clean or '¥' in clean or len(clean) < 3:
+                continue
+            name_jp = clean
+
+            chunk_after = html[m.end():m.end() + 2500]
+            sold_out = bool(re.search(r'soldout|sold[\s_-]?out|売り切れ', chunk_after[:2000], re.IGNORECASE))
+            if not sold_out:
+                img_idx += 1
+                continue
+
+            price_match = re.search(r'[￥¥]([\d,]+)', chunk_after)
+            if not price_match:
+                img_idx += 1
+                continue
+            price_str = "￥" + price_match.group(1)
+
+            ver_match = None
+            if img_idx < len(main_imgs):
+                ver_search = re.search(r'version/(\d+)/', main_imgs[img_idx])
+                ver_match = int(ver_search.group(1)) if ver_search else 0
+            version = ver_match or 0
+            img_idx += 1
+
             name_en = translate_to_english(name_jp) if is_japanese(name_jp) else name_jp
             combined = (name_en + " " + name_jp).lower()
             matches = sum(1 for kw in keywords if kw.lower() in combined)
             if matches >= min_matches and not any(s["name_jp"] == name_jp for s in sold_items):
                 sold_items.append({"name_jp": name_jp, "name_en": name_en, "price": price_str, "version": version})
+
+            if len(sold_items) >= max_soldout:
+                break
+
         sold_items.sort(key=lambda x: x["version"], reverse=True)
         return sold_items
     except Exception as e:
         print(f"Error scraping category: {e}")
         return []
+
 def scrape_instock_from_category(category_key, max_items=30):
-    """Scrape in-stock items from an eaglecapitalone category page."""
+    """Scrape in-stock items from an eaglecapitalone category page.
+    Product names live in <strong> tags. The main product photo is
+    identified via its distinctive 'src="URL" itemprop="image"' marker
+    (confirmed via raw HTML inspection — thumbnails don't carry this
+    marker, and the srcset attribute on the main image tag is too large
+    for reliable window-based backward searching). Images and names are
+    paired positionally since both appear once per product, in the same
+    document order."""
     url = ECO_CATEGORY_URLS.get(category_key)
     if not url:
         return []
@@ -458,35 +560,40 @@ def scrape_instock_from_category(category_key, max_items=30):
         html = response.text
         items = []
 
-        # Find all product blocks — each has a <strong> name + price
-        # In-stock items do NOT have 'soldout' in their block
+        # Main product images, in document order
+        main_imgs = [mm.group(1) for mm in re.finditer(r'src="([^"]+)"\s+itemprop="image"', html)]
+
         strongs = list(re.finditer(r'<strong>(.*?)</strong>', html, re.DOTALL))
-        for i, m in enumerate(strongs):
+        img_idx = 0
+        for m in strongs:
             clean = re.sub(r'<.*?>', '', m.group(1)).strip()
             if not clean or '￥' in clean or '¥' in clean or len(clean) < 3:
                 continue
-
             name_jp = clean
 
-            # Look forward for price
-            chunk_after = html[m.start():m.start() + 2000]
+            chunk_after = html[m.end():m.end() + 2500]
             price_match = re.search(r'[￥¥]([\d,]+)', chunk_after)
             if not price_match:
                 continue
             price_str = "￥" + price_match.group(1)
 
-            # Check if this block contains 'soldout' — skip if so
-            chunk_context = html[max(0, m.start() - 500):m.start() + 2000]
-            if re.search(r'soldout', chunk_context, re.IGNORECASE):
+            sold_out = bool(re.search(r'soldout|sold[\s_-]?out|売り切れ', chunk_after[:2000], re.IGNORECASE))
+            if sold_out:
+                img_idx += 1  # keep image list aligned even when skipping this item
                 continue
 
-            # Get image URL
-            img_match = re.search(r'src="(https?://[^"]+\.(?:jpg|jpeg|png))"', chunk_context)
-            img_url = img_match.group(1) if img_match else None
+            img_url = None
+            if img_idx < len(main_imgs):
+                img_url = main_imgs[img_idx]
+                if img_url.startswith("//"): img_url = "https:" + img_url
+                elif img_url.startswith("/"): img_url = "https://www.eaglecapitalone.com" + img_url
+            img_idx += 1
 
-            # Get product URL
-            url_match = re.search(r'href="(https?://www\.eaglecapitalone\.com/[^"]+)"', chunk_context)
-            product_url = url_match.group(1) if url_match else None
+            pid_match = re.search(r'productId=([A-Za-z0-9]+)', chunk_after)
+            if pid_match:
+                product_url = f"https://www.eaglecapitalone.com/j/shop/info/m/?productId={pid_match.group(1)}"
+            else:
+                product_url = url
 
             name_en = translate_to_english(name_jp) if is_japanese(name_jp) else name_jp
 
@@ -503,7 +610,7 @@ def scrape_instock_from_category(category_key, max_items=30):
             if len(items) >= max_items:
                 break
 
-        print(f"ECO {category_key}: found {len(items)} in-stock items")
+        print(f"ECO {category_key}: found {len(items)} in-stock items, {len(main_imgs)} main images available")
         return items
     except Exception as e:
         print(f"ECO instock scrape error ({category_key}): {e}")
@@ -534,20 +641,163 @@ async def check_eco_deal_item(item, sgd_rate):
             return None
 
 
+# ── ECO keyword-scoped search & deal helpers ──
+ECO_KEYWORD_JP_MAP = {
+    "feather":       ["フェザー"],
+    "large feather": ["特大フェザー"],
+    "heart feather": ["ハートホイールフェザー"],
+    "plain feather": ["プレーンフェザー", "プレーン"],
+    "used feather":  ["中古"],
+    "gold tip":      ["先金"],
+    "wheel":         ["ホイール"],
+    "hook":          ["フック"],
+    "eagle":         ["イーグル"],
+    "metal":         ["メタル"],
+    "sun metal":     ["太陽メタル", "サンメタル"],
+    "bracelet":      ["ブレス"],
+    "ring":          ["リング"],
+    "concho":        ["コンチョ"],
+    "cross":         ["クロス"],
+    "belt":          ["ベルト"],
+    "spoon":         ["スプーン"],
+    "gold":          ["ゴールド", "金"],
+}
+
+def detect_eco_category(keyword):
+    kw = keyword.lower()
+    if "large feather" in kw or "特大フェザー" in keyword: return "feather"
+    if "heart feather" in kw or "ハートホイールフェザー" in keyword: return "heartfeather"
+    if "plain feather" in kw or "プレーン" in keyword: return "plainfeather"
+    if "used feather" in kw: return "usedfeather"
+    if "gold tip" in kw or "先金" in keyword: return "feather"
+    if "sun metal" in kw or "太陽メタル" in keyword: return "metal"
+    if "wheel" in kw or "ホイール" in keyword: return "wheel"
+    if "hook" in kw or "フック" in keyword: return "hook"
+    if "eagle" in kw or "イーグル" in keyword: return "eagle"
+    if "bracelet" in kw or "brace" in kw or "ブレス" in keyword: return "brace"
+    if "ring" in kw or "リング" in keyword: return "ring"
+    if "concho" in kw or "コンチョ" in keyword: return "concho"
+    if "cross" in kw or "クロス" in keyword: return "cross"
+    if "belt" in kw or "ベルト" in keyword: return "belt"
+    if "spoon" in kw or "スプーン" in keyword: return "spoon"
+    if "metal" in kw or "メタル" in keyword: return "metal"
+    if "feather" in kw or "フェザー" in keyword: return "feather"
+    return None
+
+def search_eco_category(category_key, keyword, max_items=50, exclude_terms=None):
+    try:
+        category_items = scrape_instock_from_category(category_key, max_items=100)
+        jp_keywords = ECO_KEYWORD_JP_MAP.get(keyword.lower(), [])
+        exclude_terms = exclude_terms or []
+        items = []
+        for it in category_items:
+            name_jp = it["name_jp"]
+            name_en_check = it["name_en"]
+            if any(ex in name_en_check.lower() or ex in name_jp for ex in exclude_terms):
+                continue
+            jp_match = any(jk in name_jp for jk in jp_keywords) if jp_keywords else False
+            en_match = keyword.lower() in name_en_check.lower() or keyword.lower() in name_jp.lower()
+            if not (jp_match or en_match):
+                continue
+            items.append(it)
+            if len(items) >= max_items:
+                break
+        return items
+    except Exception as e:
+        print(f"ECO category search error: {e}"); return []
+
+
+async def check_eco_deal_item_kw(item, keyword, sgd_rate):
+    async with ECO_SEMAPHORE:
+        try:
+            jp_keywords = ECO_KEYWORD_JP_MAP.get(keyword.lower(), [keyword])
+            site_sold = await asyncio.to_thread(
+                scrape_sold_from_category, item["category"], jp_keywords, 1
+            )
+            if not site_sold:
+                return None
+            margin = check_price_margin(item["price"], site_sold, threshold_percent=10, always_show=False)
+            if margin and "BELOW" in margin:
+                return {**item, "margin": margin, "site_sold": site_sold}
+            return None
+        except Exception as e:
+            print(f"ECO keyword deal check error for {item['name_jp']}: {e}")
+            return None
+
+
 async def cmd_ecodeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_not_paused(update):
         return
     chat_id = update.effective_chat.id
+    keyword = " ".join(context.args).strip()
 
+    rates = get_rates(base="JPY")
+    sgd_rate = rates.get("SGD")
+
+    # ── Keyword mode: single category, keyword-filtered ──
+    if keyword:
+        category_key = detect_eco_category(keyword)
+        if not category_key:
+            await update.message.reply_text(
+                "❌ Couldn't detect category.\n"
+                "Try: feather, large feather, wheel, hook, eagle, metal, sun metal, "
+                "bracelet, ring, concho, cross, belt, spoon, gold tip"
+            )
+            return
+
+        await update.message.reply_text(f"💰 Scanning eaglecapitalone '{keyword}' items for underpriced deals...")
+
+        matching_instock = await asyncio.to_thread(search_eco_category, category_key, keyword, 100)
+        if not matching_instock:
+            await update.message.reply_text(f"❌ No in-stock items found matching '{keyword}'.")
+            return
+
+        tasks = [check_eco_deal_item_kw(i, keyword, sgd_rate) for i in matching_instock]
+        results = await asyncio.gather(*tasks)
+        deals = [r for r in results if r is not None]
+
+        if is_paused(chat_id):
+            await update.message.reply_text("⏸️ Stopped. Type /resume to continue.")
+            return
+
+        if not deals:
+            await update.message.reply_text(
+                f"📊 No '{keyword}' items found that are 10%+ below market average right now."
+            )
+            return
+
+        await update.message.reply_text(
+            f"💰 Found {len(deals)} underpriced '{keyword}' item(s) on eaglecapitalone!\n{'─' * 30}"
+        )
+
+        for idx, i in enumerate(deals[:10], 1):
+            if is_paused(chat_id):
+                await update.message.reply_text(f"⏸️ Stopped at item {idx}. Type /resume to continue.")
+                return
+            price_line = format_price(i["price"], sgd_rate)
+            caption = f"{idx}. {i['name_en']}\n({i['name_jp']})\n{price_line}\n{i['margin']}\n📊 Similar sold:"
+            for s in i["site_sold"][:3]:
+                caption += f"\n  • {s['name_en']}: {format_price(s['price'], sgd_rate)}"
+            if i.get("product_url"):
+                caption += f"\n🔗 {i['product_url']}"
+            await safe_send(
+                context, update.effective_chat.id,
+                photo=i.get("img_url"),
+                caption=caption if i.get("img_url") else None,
+                text=caption if not i.get("img_url") else None
+            )
+            await asyncio.sleep(0.5)
+
+        if len(deals) > 10:
+            await update.message.reply_text(f"ℹ️ Showing top 10 of {len(deals)} deals found.")
+        return
+
+    # ── No keyword: scan all categories ──
     await update.message.reply_text(
         "💰 Scanning eaglecapitalone for underpriced items...\n"
         "⚡ Checking all categories in parallel — this may take 1-2 minutes"
     )
 
-    rates = get_rates(base="JPY")
-    sgd_rate = rates.get("SGD")
-
-    # ── Step 1: Scrape in-stock items from all categories ──
     all_items = []
     for category_key in ECO_CATEGORY_URLS:
         if is_paused(chat_id):
@@ -566,7 +816,6 @@ async def cmd_ecodeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔍 Now checking prices against market averages..."
     )
 
-    # ── Step 2: Check each item's price vs sold average concurrently ──
     tasks = [check_eco_deal_item(item, sgd_rate) for item in all_items]
     results = await asyncio.gather(*tasks)
     deals = [r for r in results if r is not None]
@@ -619,8 +868,11 @@ async def cmd_ecodeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(deals) > 10:
         await update.message.reply_text(
             f"ℹ️ Showing top 10 of {len(deals)} deals found. "
-            f"Run /soldonsite <category> to dig deeper into a specific category."
+            f"Run /ecodeal <keyword> to dig deeper into a specific category, "
+            f"or /soldonsite <category> for raw sold history."
         )
+
+
 def get_similar_sold_prices(name_en, name_jp, max_results=3):
     category_key = detect_category(name_en, name_jp)
     if not category_key: return []
@@ -720,84 +972,117 @@ def get_new_arrivals(force_refresh=False):
 # ════════════════════════════════════════════════════════════════
 #  RINKAN
 # ════════════════════════════════════════════════════════════════
-def scrape_rinkan_category_all(category_url, max_items=50):
-    """Scrape ALL items (in-stock + sold) from a Rinkan category page, no keyword filter."""
-    try:
-        scraper = make_scraper()
-        response = scraper.get(category_url, headers=RINKAN_HEADERS, timeout=20)
-        if response.status_code != 200 or len(response.text) < 5000:
-            return []
-        response.encoding = "euc_jp"
-        html = response.text
-        soup = BeautifulSoup(html, "html.parser")
-        all_links = soup.find_all("a", href=re.compile(r'/shopdetail/\d+/'))
-        products = {}
-        for link in all_links:
-            href = link.get("href", "")
-            id_match = re.search(r'/shopdetail/(\d+)/', href)
-            if not id_match:
-                continue
-            base_href = f"/shopdetail/{id_match.group(1)}/"
-            if base_href not in products:
-                products[base_href] = {"img_url": None, "name_jp": None}
-            img_tag = link.find("img")
-            if img_tag and img_tag.get("src"):
-                src = img_tag["src"]
-                if src.startswith("//"): src = "https:" + src
-                elif src.startswith("/"): src = "https://www.rinkan-goros.com" + src
-                if products[base_href]["img_url"] is None:
-                    products[base_href]["img_url"] = src
-            text = link.get_text(strip=True)
-            if text and len(text) > 2:
-                products[base_href]["name_jp"] = text
+def scrape_rinkan_category_all(category_url, max_items=150, max_pages=3):
+    """Scrape ALL items (in-stock + sold) from a Rinkan category page, following
+    pagination. Categories can have 100-300+ items across multiple pages, and
+    rarer attributes (e.g. gold fittings, turquoise) may only appear on later
+    pages if sorted by newest-first — a single-page scrape would miss them."""
+    all_items = []
+    seen_hrefs = set()
 
-        items = []
-        for base_href, data in products.items():
-            if not data["name_jp"]:
-                continue
-            name_jp = data["name_jp"]
-            link_pos = html.find(base_href)
-            if link_pos == -1:
-                continue
-            chunk = html[max(0, link_pos - 500):link_pos + 1500]
-            price_match = re.search(r'([\d,]+)円', chunk)
-            if not price_match:
-                continue
-            price_str = price_match.group(1) + "円"
-            sold_out = bool(re.search(r'soldout|sold[\s_-]?out|売り切れ', chunk, re.IGNORECASE))
-            name_en = translate_to_english(name_jp) if is_japanese(name_jp) else name_jp
-            items.append({
-                "name_jp": name_jp,
-                "name_en": name_en,
-                "price": price_str,
-                "img_url": data["img_url"],
-                "product_url": "https://www.rinkan-goros.com" + base_href,
-                "sold_out": sold_out,
-                "source": "Rinkan",
-            })
-            if len(items) >= max_items:
+    # Extract the numeric category code so we can build page URLs for page 2+
+    code_match = re.search(r'/category/(\d+)', category_url)
+    category_code = code_match.group(1) if code_match else None
+
+    for page_num in range(1, max_pages + 1):
+        if len(all_items) >= max_items:
+            break
+
+        if page_num == 1:
+            page_url = category_url
+        elif category_code:
+            page_url = f"https://www.rinkan-goros.com/shopbrand/{category_code}/page{page_num}/brandname/"
+        else:
+            break  # can't build page 2+ URLs without a category code
+
+        try:
+            scraper = make_scraper()
+            response = scraper.get(page_url, headers=RINKAN_HEADERS, timeout=20)
+            if response.status_code != 200 or len(response.text) < 5000:
                 break
-        print(f"Rinkan category scrape: {len(items)} items ({sum(1 for i in items if i['sold_out'])} sold)")
-        return items
-    except Exception as e:
-        print(f"Rinkan full category scrape error: {e}")
-        return []
+            response.encoding = "euc_jp"
+            html = response.text
+            soup = BeautifulSoup(html, "html.parser")
+            all_links = soup.find_all("a", href=re.compile(r'/shopdetail/\d+/'))
+            products = {}
+            for link in all_links:
+                href = link.get("href", "")
+                id_match = re.search(r'/shopdetail/(\d+)/', href)
+                if not id_match:
+                    continue
+                base_href = f"/shopdetail/{id_match.group(1)}/"
+                if base_href in seen_hrefs:
+                    continue
+                if base_href not in products:
+                    products[base_href] = {"img_url": None, "name_jp": None}
+                img_tag = link.find("img")
+                if img_tag and img_tag.get("src"):
+                    src = img_tag["src"]
+                    if src.startswith("//"): src = "https:" + src
+                    elif src.startswith("/"): src = "https://www.rinkan-goros.com" + src
+                    if products[base_href]["img_url"] is None:
+                        products[base_href]["img_url"] = src
+                text = link.get_text(strip=True)
+                if text and len(text) > 2:
+                    products[base_href]["name_jp"] = text
+
+            page_item_count = 0
+            for base_href, data in products.items():
+                if not data["name_jp"]:
+                    continue
+                name_jp = data["name_jp"]
+                link_pos = html.find(base_href)
+                if link_pos == -1:
+                    continue
+                chunk = html[max(0, link_pos - 500):link_pos + 1500]
+                price_match = re.search(r'([\d,]+)円', chunk)
+                if not price_match:
+                    continue
+                price_str = price_match.group(1) + "円"
+                sold_out = bool(re.search(r'soldout|sold[\s_-]?out|売り切れ', chunk, re.IGNORECASE))
+                name_en = translate_to_english(name_jp) if is_japanese(name_jp) else name_jp
+                all_items.append({
+                    "name_jp": name_jp,
+                    "name_en": name_en,
+                    "price": price_str,
+                    "img_url": data["img_url"],
+                    "product_url": "https://www.rinkan-goros.com" + base_href,
+                    "sold_out": sold_out,
+                    "source": "Rinkan",
+                })
+                seen_hrefs.add(base_href)
+                page_item_count += 1
+                if len(all_items) >= max_items:
+                    break
+
+            if page_item_count == 0:
+                break  # end of category, no more pages have new items
+
+        except Exception as e:
+            print(f"Rinkan category scrape error (page {page_num}): {e}")
+            break
+
+    print(f"Rinkan category scrape: {len(all_items)} items across pages ({sum(1 for i in all_items if i['sold_out'])} sold)")
+    return all_items
 
 
 def get_rinkan_comps(item, category_items):
-    """Comparable items for margin calc: prefer sold items with keyword overlap,
-    fall back to all other listings in the category if not enough sold comps."""
     stop_words = {'the','and','for','with','on','at','in','of','a','an','current','latest',
                   'old','new','good','condition','excellent','very','rare','individual',
                   'model','size','right','left','no','super','mint'}
     name_en_base = re.sub(r'\[.*?\]', '', item["name_en"]).strip().lower()
     key_words = [w for w in name_en_base.split() if len(w) >= 3 and w not in stop_words]
+    item_tags = extract_rinkan_tags(item["name_jp"], item["name_en"])
 
     def overlaps(other):
         if other["product_url"] == item["product_url"]:
             return False
         combined = (other["name_en"] + " " + other["name_jp"]).lower()
-        return any(kw in combined for kw in key_words) if key_words else True
+        kw_match = any(kw in combined for kw in key_words) if key_words else True
+        if not kw_match:
+            return False
+        other_tags = extract_rinkan_tags(other["name_jp"], other["name_en"])
+        return tags_compatible(item_tags, other_tags)
 
     sold_comps = [c for c in category_items if c.get("sold_out") and overlaps(c)]
     if len(sold_comps) >= 2:
@@ -823,23 +1108,158 @@ async def check_rinkan_deal_item(item, category_items, sgd_rate):
             return None
 
 
+def get_rinkan_comps_by_keyword(item, category_items, keyword):
+    jp_keywords = RINKAN_KEYWORD_JP_MAP.get(keyword.lower(), [])
+    exclude_terms = ["feather", "フェザー"] if keyword.lower() == "wheel" else []
+
+    item_tags = extract_rinkan_tags(item["name_jp"], item["name_en"])
+
+    def matches(other):
+        combined_en = other["name_en"].lower()
+        combined_jp = other["name_jp"]
+        if any(ex in combined_en or ex in combined_jp for ex in exclude_terms):
+            return False
+        en_match = keyword.lower() in combined_en
+        jp_match = any(jk in combined_jp for jk in jp_keywords) if jp_keywords else False
+        if not (en_match or jp_match):
+            return False
+        other_tags = extract_rinkan_tags(other["name_jp"], other["name_en"])
+        return tags_compatible(item_tags, other_tags)
+
+    def is_self(other):
+        return other["product_url"] == item["product_url"]
+
+    sold_comps = [c for c in category_items if c.get("sold_out") and matches(c) and not is_self(c)]
+    if len(sold_comps) >= 2:
+        return sold_comps, False
+    all_comps = [c for c in category_items if matches(c) and not is_self(c)]
+    return all_comps, True
+
+
+async def check_rinkan_deal_item_kw(item, category_items, keyword, sgd_rate):
+    async with RINKAN_SEMAPHORE:
+        try:
+            comps, loose = await asyncio.to_thread(
+                get_rinkan_comps_by_keyword, item, category_items, keyword
+            )
+            if len(comps) < 2:
+                return None
+            margin = check_price_margin(item["price"], comps, threshold_percent=10, always_show=False)
+            if margin and "BELOW" in margin:
+                for c in comps:
+                    c["loose_match"] = loose
+                return {**item, "margin": margin, "site_sold": comps[:3]}
+            return None
+        except Exception as e:
+            print(f"Rinkan keyword deal check error for {item['name_jp']}: {e}")
+            return None
+
+
 async def cmd_rinkandeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_not_paused(update):
         return
     chat_id = update.effective_chat.id
+    keyword = " ".join(context.args).strip()
 
+    rates = get_rates(base="JPY")
+    sgd_rate = rates.get("SGD")
+
+    # ── Keyword mode: single category, keyword-filtered ──
+    if keyword:
+        category_key = detect_rinkan_category(keyword)
+        if not category_key:
+            await update.message.reply_text(
+                "❌ Couldn't detect category.\n"
+                "Try: feather, large feather, ring, bracelet, necklace, belt, concho, wallet, bag, metal, gold, "
+                "gold top, silver top, kamikane, tip, turquoise, wheel, eagle, allgold, claw, "
+                "sv sun, gold sun, gold insun"
+            )
+            return
+        category_url = RINKAN_CATEGORY_URLS.get(category_key)
+
+        await update.message.reply_text(f"💰 Scanning Rinkan '{keyword}' items for underpriced deals...")
+
+        category_items = await asyncio.to_thread(scrape_rinkan_category_all, category_url, 300, 6)
+        if not category_items:
+            await update.message.reply_text("❌ Could not fetch items. Try again later.")
+            return
+
+        # Exclude feather items when searching for pure "wheel"
+        exclude_terms = []
+        if keyword.lower() == "wheel":
+            exclude_terms = ["feather", "フェザー"]
+
+        jp_keywords = RINKAN_KEYWORD_JP_MAP.get(keyword.lower(), [])
+
+        matching_instock = [
+            i for i in category_items
+            if not i.get("sold_out")
+            and (
+                keyword.lower() in i["name_en"].lower()
+                or keyword.lower() in i["name_jp"].lower()
+                or any(jk in i["name_jp"] for jk in jp_keywords)
+            )
+            and not any(ex in i["name_en"].lower() or ex in i["name_jp"] for ex in exclude_terms)
+        ]
+        if not matching_instock:
+            await update.message.reply_text(f"❌ No in-stock items found matching '{keyword}'.")
+            return
+
+        tasks = [check_rinkan_deal_item_kw(i, category_items, keyword, sgd_rate) for i in matching_instock]
+        results = await asyncio.gather(*tasks)
+        deals = [r for r in results if r is not None]
+
+        if is_paused(chat_id):
+            await update.message.reply_text("⏸️ Stopped. Type /resume to continue.")
+            return
+
+        if not deals:
+            await update.message.reply_text(
+                f"📊 No '{keyword}' items found that are 10%+ below market average right now."
+            )
+            return
+
+        await update.message.reply_text(
+            f"💰 Found {len(deals)} underpriced '{keyword}' item(s) on Rinkan!\n{'─' * 30}"
+        )
+
+        for idx, i in enumerate(deals[:10], 1):
+            if is_paused(chat_id):
+                await update.message.reply_text(f"⏸️ Stopped at item {idx}. Type /resume to continue.")
+                return
+            price_line = format_price(i["price"], sgd_rate)
+            is_loose = any(s.get("loose_match") for s in i["site_sold"])
+            comp_label = "📊 Similar listings (loose match):" if is_loose else "📊 Similar sold/listed:"
+            caption = (
+                f"{idx}. {i['name_en']}\n({i['name_jp']})\n{price_line}\n{i['margin']}\n{comp_label}"
+            )
+            for s in i["site_sold"][:3]:
+                tag = " (sold)" if s.get("sold_out") else ""
+                caption += f"\n  • {s['name_en']}{tag}: {format_price(s['price'], sgd_rate)}"
+            if i.get("product_url"):
+                caption += f"\n🔗 {i['product_url']}"
+            await safe_send(
+                context, update.effective_chat.id,
+                photo=i.get("img_url"),
+                caption=caption if i.get("img_url") else None,
+                text=caption if not i.get("img_url") else None
+            )
+            await asyncio.sleep(0.5)
+
+        if len(deals) > 10:
+            await update.message.reply_text(f"ℹ️ Showing top 10 of {len(deals)} deals found.")
+        return
+
+    # ── No keyword: scan all categories (original behavior) ──
     await update.message.reply_text(
         "💰 Scanning Rinkan for underpriced items...\n"
         "⚡ Checking all categories in parallel — this may take 1-2 minutes"
     )
 
-    rates = get_rates(base="JPY")
-    sgd_rate = rates.get("SGD")
-
     all_deals = []
     seen_urls = set()
     for category_url in RINKAN_CATEGORY_URLS.values():
-        if category_url in seen_urls:  # bag/wallet share a URL
+        if category_url in seen_urls:
             continue
         seen_urls.add(category_url)
 
@@ -847,7 +1267,7 @@ async def cmd_rinkandeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⏸️ Stopped. Type /resume to continue.")
             return
 
-        category_items = await asyncio.to_thread(scrape_rinkan_category_all, category_url, 50)
+        category_items = await asyncio.to_thread(scrape_rinkan_category_all, category_url, 300, 6)
         if not category_items:
             await asyncio.sleep(1)
             continue
@@ -864,38 +1284,25 @@ async def cmd_rinkandeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not all_deals:
         await update.message.reply_text(
-            "📊 No items found on Rinkan that are 10%+ below market average right now.\n"
-            "Everything appears to be priced at or above market."
+            "📊 No items found on Rinkan that are 10%+ below market average right now."
         )
         return
 
-    await update.message.reply_text(
-        f"💰 Found {len(all_deals)} underpriced item(s) on Rinkan!\n{'─' * 30}"
-    )
+    await update.message.reply_text(f"💰 Found {len(all_deals)} underpriced item(s) on Rinkan!\n{'─' * 30}")
 
     for idx, i in enumerate(all_deals[:10], 1):
         if is_paused(chat_id):
             await update.message.reply_text(f"⏸️ Stopped at item {idx}. Type /resume to continue.")
             return
-
         price_line = format_price(i["price"], sgd_rate)
         is_loose = any(s.get("loose_match") for s in i["site_sold"])
         comp_label = "📊 Similar listings (loose match):" if is_loose else "📊 Similar sold/listed:"
-
-        caption = (
-            f"{idx}. {i['name_en']}\n"
-            f"({i['name_jp']})\n"
-            f"{price_line}\n"
-            f"{i['margin']}\n"
-            f"{comp_label}"
-        )
+        caption = f"{idx}. {i['name_en']}\n({i['name_jp']})\n{price_line}\n{i['margin']}\n{comp_label}"
         for s in i["site_sold"][:3]:
             tag = " (sold)" if s.get("sold_out") else ""
             caption += f"\n  • {s['name_en']}{tag}: {format_price(s['price'], sgd_rate)}"
-
         if i.get("product_url"):
             caption += f"\n🔗 {i['product_url']}"
-
         await safe_send(
             context, update.effective_chat.id,
             photo=i.get("img_url"),
@@ -907,8 +1314,10 @@ async def cmd_rinkandeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(all_deals) > 10:
         await update.message.reply_text(
             f"ℹ️ Showing top 10 of {len(all_deals)} deals found. "
-            f"Run /rinkansearch <keyword> to dig deeper into a specific category."
+            f"Run /rinkandeal <keyword> to dig deeper into a specific category."
         )
+
+
 def get_rinkan_new_arrivals(force_refresh=False):
     cache = new_arrivals_cache["rinkan"]
     if not force_refresh and cache["data"] is not None and (time.time() - cache["timestamp"]) < NEW_ARRIVALS_CACHE_DURATION:
@@ -965,9 +1374,53 @@ def check_rinkan_availability(scraper, product_url, retries=2):
             print(f"Rinkan availability error: {e}"); time.sleep(3)
     return "❓ Unknown"
 
+
+RINKAN_KEYWORD_JP_MAP = {
+    "gold":            ["金", "ゴールド", "上金", "先金"],
+    "silver":          ["銀", "シルバー", "SV", "上銀", "先銀"],
+    "gold top":        ["上金"],
+    "silver top":      ["上銀"],
+    "kamikane":        ["上金", "上銀"],
+    "kamigane":        ["上金", "上銀"],
+    "tip":             ["先金", "先銀"],
+    "tip gold":        ["先金"],
+    "tip silver":      ["先銀"],
+    "turquoise":       ["ターコイズ"],
+    "rope":            ["縄", "ロープ"],
+    "turquoise rope":  ["ターコイズ", "縄"],
+    "old":             ["オールド", "OLD"],
+    "new":             ["新品"],
+    "plain":           ["プレーン"],
+    "rare":            ["希少", "レア"],
+    "bag":             ["バッグ"],
+    "concho":          ["コンチョ"],
+    "wheel":           ["ホイール"],
+    "ring":            ["リング"],
+    "bracelet":        ["ブレス"],
+    "necklace":        ["ネックレス"],
+    "belt":            ["ベルト"],
+    "wallet":          ["財布"],
+    "metal":           ["メタル"],
+    "sunmetal":        ["太陽メタル", "サンメタル"],
+    "sv sun":          ["SV太陽", "銀太陽", "太陽"],
+    "gold sun":        ["全金メタル"],
+    "gold insun":      ["全金太陽メタル"],
+    "eagle":           ["イーグル"],
+    "claw":            ["クロー"],
+    "allgold":         ["全金"],
+}
+
 def detect_rinkan_category(keyword):
     kw = keyword.lower()
     if "large feather" in kw or "特大フェザー" in keyword: return "largefeather"
+    if "wheel feather" in kw or "ホイールフェザー" in keyword: return "feather"
+    if "wheel" in kw or "ホイール" in keyword: return "wheel"
+    if any(t in kw for t in ["gold top", "silver top", "kamikane", "kamigane"]): return "largefeather"
+    if "tip" in kw or "先金" in keyword or "先銀" in keyword: return "largefeather"
+    if "turquoise" in kw or "ターコイズ" in keyword: return "largefeather"
+    if "sv sun" in kw or "gold sun" in kw or "gold insun" in kw: return "metal"
+    if "allgold" in kw or "all gold" in kw: return "allgold"
+    if "claw" in kw or "クロー" in keyword: return "largefeather"
     if "feather" in kw or "フェザー" in keyword: return "feather"
     if "ring" in kw or "リング" in keyword: return "ring"
     if "necklace" in kw or "ネックレス" in keyword: return "necklace"
@@ -977,52 +1430,37 @@ def detect_rinkan_category(keyword):
     if "bag" in kw or "バッグ" in keyword: return "bag"
     if "wallet" in kw or "財布" in keyword: return "wallet"
     if "metal" in kw or "メタル" in keyword: return "metal"
+    if "eagle" in kw or "イーグル" in keyword: return "eagle"
     if "gold" in kw or "金" in keyword or "ゴールド" in keyword: return "largefeather"
+    if "silver" in kw or "銀" in keyword or "シルバー" in keyword: return "largefeather"
     return None
 
 def search_rinkan_category(category_url, keyword, max_items=10, exclude_jp=None):
     try:
-        scraper = make_scraper()
-        response = scraper.get(category_url, headers=RINKAN_HEADERS, timeout=20)
-        if response.status_code != 200 or len(response.text) < 5000: return []
-        response.encoding = "euc_jp"
-        html = response.text
-        soup = BeautifulSoup(html, "html.parser")
-        all_links = soup.find_all("a", href=re.compile(r'/shopdetail/\d+/'))
-        products = {}
-        for link in all_links:
-            href = link.get("href", "")
-            id_match = re.search(r'/shopdetail/(\d+)/', href)
-            if not id_match: continue
-            base_href = f"/shopdetail/{id_match.group(1)}/"
-            if base_href not in products: products[base_href] = {"img_url": None, "name_jp": None}
-            img_tag = link.find("img")
-            if img_tag and img_tag.get("src"):
-                src = img_tag["src"]
-                if src.startswith("//"): src = "https:" + src
-                elif src.startswith("/"): src = "https://www.rinkan-goros.com" + src
-                if products[base_href]["img_url"] is None: products[base_href]["img_url"] = src
-            text = link.get_text(strip=True)
-            if text and len(text) > 2: products[base_href]["name_jp"] = text
-        keyword_jp_map = {"gold":["金","ゴールド","上金","先金"],"silver":["銀","シルバー","SV"],"turquoise":["ターコイズ"],"feather":["フェザー"],"old":["オールド","OLD"],"new":["新品"],"plain":["プレーン"],"rare":["希少","レア"],"bag":["バッグ"],"concho":["コンチョ"]}
-        jp_keywords = keyword_jp_map.get(keyword.lower(), [])
+        category_items = scrape_rinkan_category_all(category_url, max_items=300, max_pages=6)
+        jp_keywords = RINKAN_KEYWORD_JP_MAP.get(keyword.lower(), [])
         exclude_jp = exclude_jp or []
         items = []
-        for base_href, data in products.items():
-            if not data["name_jp"]: continue
-            name_jp = data["name_jp"]
-            if any(ex in name_jp for ex in exclude_jp): continue
+        for it in category_items:
+            name_jp = it["name_jp"]
+            name_en_check = it["name_en"]
+            if any(ex in name_jp for ex in exclude_jp):
+                continue
             jp_match = any(jk in name_jp for jk in jp_keywords) if jp_keywords else False
-            name_en_check = translate_to_english(name_jp) if is_japanese(name_jp) else name_jp
             en_match = keyword.lower() in name_en_check.lower() or keyword.lower() in name_jp.lower()
-            if not (jp_match or en_match): continue
-            link_pos = html.find(base_href)
-            if link_pos == -1: continue
-            chunk = html[link_pos:link_pos + 1500]
-            price_match = re.search(r'([\d,]+)円', chunk)
-            if not price_match: continue
-            items.append({"name_jp": name_jp, "name_en": name_en_check, "price": price_match.group(1) + "円", "img_url": data["img_url"], "product_url": "https://www.rinkan-goros.com" + base_href, "source": "Rinkan"})
-        return items[:max_items]
+            if not (jp_match or en_match):
+                continue
+            items.append({
+                "name_jp": name_jp,
+                "name_en": name_en_check,
+                "price": it["price"],
+                "img_url": it["img_url"],
+                "product_url": it["product_url"],
+                "source": "Rinkan",
+            })
+            if len(items) >= max_items:
+                break
+        return items
     except Exception as e:
         print(f"Rinkan category search error: {e}"); return []
 
@@ -1255,26 +1693,156 @@ async def cmd_newdelta(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_rinkansearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_not_paused(update): return
     chat_id = update.effective_chat.id
-    keyword = " ".join(context.args).strip()
-    if not keyword: await update.message.reply_text("Usage: /rinkansearch <keyword>\nExample: /rinkansearch feather"); return
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /rinsearch <keyword> [page]\n"
+            "Example: /rinsearch feather\n"
+            "/rinsearch feather 2 — for page 2"
+        )
+        return
+
+    # If the last arg is a page number, split it off from the keyword
+    page = 1
+    if len(args) > 1 and args[-1].isdigit():
+        page = int(args[-1])
+        keyword = " ".join(args[:-1]).strip()
+    else:
+        keyword = " ".join(args).strip()
+
+    if not keyword:
+        await update.message.reply_text("Usage: /rinsearch <keyword> [page]")
+        return
+
     category_key = detect_rinkan_category(keyword)
-    if not category_key: await update.message.reply_text("❌ Couldn't detect category.\nTry: feather, ring, bracelet, necklace, belt, concho, wallet, bag, metal, gold"); return
+    if not category_key:
+        await update.message.reply_text(
+            "❌ Couldn't detect category.\n"
+            "Try: feather, ring, bracelet, necklace, belt, concho, wallet, bag, metal, gold, wheel, "
+            "eagle, allgold, claw, sv sun, gold sun, gold insun"
+        )
+        return
     category_url = RINKAN_CATEGORY_URLS.get(category_key)
-    await update.message.reply_text(f"🔍 Searching Rinkan for '{keyword}'... please wait")
-    exclude_jp = ["上金","ターコイズ","メタル付"] if keyword.lower() == "gold" else []
-    items = search_rinkan_category(category_url, keyword, max_items=10, exclude_jp=exclude_jp)
-    if not items: await update.message.reply_text(f"❌ No items found for '{keyword}'"); return
+    await update.message.reply_text(f"🔍 Searching Rinkan for '{keyword}' (page {page})... please wait")
+
+    exclude_jp = []
+    if keyword.lower() == "gold":
+        exclude_jp = ["上金", "ターコイズ", "メタル付"]
+    elif keyword.lower() == "wheel":
+        exclude_jp = ["フェザー"]
+
+    all_items = search_rinkan_category(category_url, keyword, max_items=100, exclude_jp=exclude_jp)
+    if not all_items:
+        await update.message.reply_text(f"❌ No items found for '{keyword}'")
+        return
+
+    # Sort by price ascending (lowest first)
+    def price_sort_key(it):
+        p = parse_price_number(it["price"])
+        return p if p is not None else float("inf")
+    all_items.sort(key=price_sort_key)
+
+    PAGE_SIZE = 10
+    total_items = len(all_items)
+    total_pages = (total_items + PAGE_SIZE - 1) // PAGE_SIZE
+    if page < 1:
+        page = 1
+    if page > total_pages:
+        page = total_pages
+    start = (page - 1) * PAGE_SIZE
+    end = start + PAGE_SIZE
+    items = all_items[start:end]
+
     rates = get_rates(base="JPY"); sgd_rate = rates.get("SGD")
-    await update.message.reply_text(f"🔍 Rinkan Results for '{keyword}' ({len(items)} found)\n{'─'*30}")
+    await update.message.reply_text(
+        f"🔍 Rinkan Results for '{keyword}' — page {page}/{total_pages} "
+        f"({total_items} total, sorted by price ↑)\n{'─'*30}"
+    )
     scraper = make_scraper()
     results = await asyncio.gather(*[check_rinkan_item_async(scraper, item) for item in items]) if items else []
     results_by_url = {r["item"]["product_url"]: r["availability"] for r in results}
-    for idx, i in enumerate(items, 1):
-        if is_paused(chat_id): await update.message.reply_text(f"⏸️ Stopped at item {idx}/{len(items)}. Type /resume to continue."); return
+    for idx, i in enumerate(items, start + 1):
+        if is_paused(chat_id):
+            await update.message.reply_text("⏸️ Stopped. Type /resume to continue.")
+            return
         price_line = format_price(i["price"], sgd_rate)
         availability = results_by_url.get(i["product_url"], "❓ Unknown")
         caption = f"{idx}. {i['name_en']}\n({i['name_jp']})\n{price_line}\n{availability}\n🏪 Source: Rinkan\n🔗 {i['product_url']}"
         await safe_send(context, update.effective_chat.id, photo=i.get("img_url"), caption=caption if i.get("img_url") else None, text=caption if not i.get("img_url") else None)
+
+    if page < total_pages:
+        await update.message.reply_text(
+            f"ℹ️ Page {page}/{total_pages}. Type /rinsearch {keyword} {page+1} for the next page."
+        )
+
+
+async def cmd_ecosearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_not_paused(update): return
+    chat_id = update.effective_chat.id
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /ecosearch <keyword> [page]\n"
+            "Example: /ecosearch feather\n"
+            "/ecosearch feather 2 — for page 2"
+        )
+        return
+
+    page = 1
+    if len(args) > 1 and args[-1].isdigit():
+        page = int(args[-1])
+        keyword = " ".join(args[:-1]).strip()
+    else:
+        keyword = " ".join(args).strip()
+
+    if not keyword:
+        await update.message.reply_text("Usage: /ecosearch <keyword> [page]")
+        return
+
+    category_key = detect_eco_category(keyword)
+    if not category_key:
+        await update.message.reply_text(
+            "❌ Couldn't detect category.\n"
+            "Try: feather, large feather, wheel, hook, eagle, metal, sun metal, "
+            "bracelet, ring, concho, cross, belt, spoon, gold tip"
+        )
+        return
+
+    await update.message.reply_text(f"🔍 Searching eaglecapitalone for '{keyword}' (page {page})... please wait")
+
+    all_items = search_eco_category(category_key, keyword, max_items=100)
+    if not all_items:
+        await update.message.reply_text(f"❌ No items found for '{keyword}'")
+        return
+
+    # Page order is already newest-posted-first — no re-sort needed
+
+    PAGE_SIZE = 10
+    total_items = len(all_items)
+    total_pages = (total_items + PAGE_SIZE - 1) // PAGE_SIZE
+    if page < 1: page = 1
+    if page > total_pages: page = total_pages
+    start = (page - 1) * PAGE_SIZE
+    end = start + PAGE_SIZE
+    items = all_items[start:end]
+
+    rates = get_rates(base="JPY"); sgd_rate = rates.get("SGD")
+    await update.message.reply_text(
+        f"🔍 eaglecapitalone Results for '{keyword}' — page {page}/{total_pages} "
+        f"({total_items} total, newest posted first)\n{'─'*30}"
+    )
+    for idx, i in enumerate(items, start + 1):
+        if is_paused(chat_id):
+            await update.message.reply_text("⏸️ Stopped. Type /resume to continue.")
+            return
+        price_line = format_price(i["price"], sgd_rate)
+        caption = f"{idx}. {i['name_en']}\n({i['name_jp']})\n{price_line}\n✅ In Stock\n🏪 Source: eaglecapitalone\n🔗 {i['product_url']}"
+        await safe_send(context, update.effective_chat.id, photo=i.get("img_url"), caption=caption if i.get("img_url") else None, text=caption if not i.get("img_url") else None)
+
+    if page < total_pages:
+        await update.message.reply_text(
+            f"ℹ️ Page {page}/{total_pages}. Type /ecosearch {keyword} {page+1} for the next page."
+        )
 
 
 async def cmd_deltasearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1458,7 +2026,8 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/neweco — eaglecapitalone new arrivals\n"
         "/newrinkan — Rinkan new arrivals\n"
         "/newdelta — DELTAone newest items\n"
-        "/rinkansearch <keyword> — Search Rinkan by category\n"
+        "/rinsearch <keyword> [page] — Search Rinkan by category, price-sorted\n"
+        "/ecosearch <keyword> [page] — Search eaglecapitalone by category, price-sorted\n"
         "/deltasearch <keyword> — Search DELTAone by category\n\n"
         "👁️ Watchlist:\n"
         "/watch <keyword> [max_price] — Add a watch\n"
@@ -1469,9 +2038,99 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🕐 Sold History:\n/soldhistory — View sold price history\n/soldonsite wheel sv — Search sold items\n\n"
         "🪶 Goro's Price Search:\n/price <keyword> — Free search\n"
         "/feather /largefeather /wheel /hook /sunmetal /eagle /ring /brace /chain /metal /cross /belt /concho /gold\n\n"
-        "🔧 Debug:\n/healthcheck — Status report on all 3 sites\n"
-        "💰 Deal Finder:\n/ecodeal — Scan eaglecapitalone for items below market avg\n\n"
-        "/rinkandeal — Scan Rinkan for items below market avg\n"
+        "🔧 Debug:\n/healthcheck — Status report on all 3 sites\n\n"
+        "💰 Deal Finder:\n"
+        "/ecodeal [keyword] — Scan eaglecapitalone for items below market avg\n"
+        "/rinkandeal [keyword] — Scan Rinkan for items below market avg\n\n"
+        "❓ Help:\n/help rinkan — Rinkan search keyword reference\n/help eco — eaglecapitalone search keyword reference\n/help delta — DELTAone search keyword reference\n"
+    )
+    await update.message.reply_text(msg)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    topic = args[0].lower() if args else ""
+
+    if topic == "rinkan":
+        msg = (
+            "🔍 Rinkan Search Keywords\n"
+            "(for /rinsearch <keyword> and /rinkandeal <keyword>)\n"
+            + "─"*30 + "\n\n"
+            "🪶 Feathers:\n"
+            "feather, large feather\n\n"
+            "🪶 Large feather fittings:\n"
+            "gold top, silver top, kamikane, kamigane,\n"
+            "tip, tip gold, tip silver,\n"
+            "turquoise, rope, turquoise rope,\n"
+            "gold, silver, old, new, plain, rare, claw\n\n"
+            "⚙️ Wheel:\n"
+            "wheel (feather-combo items auto-excluded)\n\n"
+            "⚙️ Metal:\n"
+            "metal, sv sun, gold sun, gold insun, allgold\n\n"
+            "🦅 Eagle:\n"
+            "eagle\n\n"
+            "💍 Jewelry & accessories:\n"
+            "ring, bracelet, necklace, belt, concho, bag, wallet\n\n"
+            "📄 Paging:\n"
+            "/rinsearch <keyword> <page> — e.g. /rinsearch feather 2\n\n"
+            "💰 Deal scan:\n"
+            "/rinkandeal — scan all categories\n"
+            "/rinkandeal <keyword> — scan just one, e.g. /rinkandeal wheel\n\n"
+            "ℹ️ If a search comes back empty for something you know exists, "
+            "the item's exact Japanese naming may not be mapped yet — "
+            "send a screenshot and it can be added."
+        )
+        await update.message.reply_text(msg)
+        return
+
+    if topic == "eco" or topic == "eaglecapitalone":
+        msg = (
+            "🔍 eaglecapitalone Search Keywords\n"
+            "(for /ecosearch <keyword> and /ecodeal <keyword>)\n"
+            + "─"*30 + "\n\n"
+            "feather, large feather, heart feather, plain feather, used feather, gold tip\n"
+            "wheel, hook, eagle, metal, sun metal, gold\n"
+            "bracelet, ring, concho, cross, belt, spoon\n\n"
+            "📄 Paging:\n"
+            "/ecosearch <keyword> <page> — e.g. /ecosearch feather 2\n\n"
+            "💰 Deal scan:\n"
+            "/ecodeal — scan all categories\n"
+            "/ecodeal <keyword> — scan just one, e.g. /ecodeal wheel\n\n"
+            "🕐 Sold history (raw, not deal-filtered):\n"
+            "/soldonsite <category> <keyword>\n"
+            "Categories: wheel, feather, heartfeather, plainfeather, "
+            "usedfeather, hook, eagle, metal, brace, ring, concho, cross, belt, spoon\n\n"
+            "ℹ️ If a search comes back empty for something you know exists, "
+            "the item's exact Japanese naming may not be mapped yet — "
+            "send a screenshot and it can be added."
+        )
+        await update.message.reply_text(msg)
+        return
+
+    if topic == "delta" or topic == "deltaone":
+        msg = (
+            "🔍 DELTAone Search Keywords\n"
+            "(for /deltasearch <keyword>)\n"
+            + "─"*30 + "\n\n"
+            "feather, large feather\n"
+            "eagle, eagle ring, feather ring\n"
+            "bracelet, leather brace, face bracelet\n"
+            "wheel, leather cord, chain\n"
+            "sun metal, metal\n"
+            "cross, spoon, heart, concho, ring\n"
+            "bag, wallet, beads, earring\n"
+            "old, rare, very rare, custom, current, sale"
+        )
+        await update.message.reply_text(msg)
+        return
+
+    # Default: no topic or unrecognized topic
+    msg = (
+        "❓ Help Topics\n" + "─"*30 + "\n\n"
+        "/help rinkan — Rinkan search keywords\n"
+        "/help eco — eaglecapitalone search keywords\n"
+        "/help delta — DELTAone search keywords\n\n"
+        "Or type /menu for the full command list."
     )
     await update.message.reply_text(msg)
 
@@ -1487,10 +2146,12 @@ async def main():
     app.add_handler(CommandHandler("list", list_currencies))
     app.add_handler(CommandHandler("price", price))
     app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("neweco", cmd_neweco))
     app.add_handler(CommandHandler("newrinkan", cmd_newrinkan))
     app.add_handler(CommandHandler("newdelta", cmd_newdelta))
-    app.add_handler(CommandHandler("rinkansearch", cmd_rinkansearch))
+    app.add_handler(CommandHandler("rinsearch", cmd_rinkansearch))
+    app.add_handler(CommandHandler("ecosearch", cmd_ecosearch))
     app.add_handler(CommandHandler("deltasearch", cmd_deltasearch))
     app.add_handler(CommandHandler("soldhistory", cmd_soldhistory))
     app.add_handler(CommandHandler("soldonsite", cmd_soldonsite))
