@@ -124,7 +124,7 @@ RINKAN_CATEGORY_URLS = {
     "leatherbrace": "https://www.rinkan-goros.com/category/220400",
     "pendanttop":   "https://www.rinkan-goros.com/category/220100",
     "belt":         "https://www.rinkan-goros.com/category/220600",
-    "concho":       "https://www.rinkan-goros.com/category/110700",
+    "concho":       "https://www.rinkan-goros.com/category/112200",
     "wallet":       "https://www.rinkan-goros.com/category/220900",
     "bag":          "https://www.rinkan-goros.com/category/220900",
     "metal":        "https://www.rinkan-goros.com/category/110600",
@@ -178,7 +178,11 @@ NEW_ARRIVALS_CACHE_DURATION = 600
 
 translation_cache = {}
 last_known_update = {"date": ""}
+last_eco_notify_day = {"date": ""}
+last_known_rinkan_urls = set()
+last_known_delta_urls = set()
 paused_chats = set()
+last_delta_search = {}  # chat_id -> keyword string
 
 ECO_SEMAPHORE = None
 RINKAN_SEMAPHORE = None
@@ -472,10 +476,28 @@ def tags_compatible(tags_a, tags_b):
     return True
 
 def check_item_availability(scraper, product_url):
+    """Checks a single product page's real availability via its
+    itemprop="availability" schema.org meta tag (InStock/OutOfStock),
+    rather than scanning the page's raw visible text for the words
+    'soldout' or '在庫あり'. The product page template includes hidden
+    UI elements (e.g. a restock-notification widget) that contain the
+    literal word 'soldout' even when the item is actually in stock —
+    a naive text scan hits that false positive before ever reaching
+    the real stock status further down the page."""
     try:
         product_url = product_url.replace("//app", "/app")
         response = scraper.get(product_url, timeout=15, allow_redirects=True)
         soup = BeautifulSoup(response.text, "html.parser")
+
+        avail_tag = soup.find(itemprop="availability")
+        if avail_tag and avail_tag.get("content"):
+            content = avail_tag["content"]
+            if content == "OutOfStock":
+                return "❌ Sold Out"
+            elif content == "InStock":
+                return "✅ In Stock"
+
+        # fallback to the old text scan only if no schema tag is found at all
         for line in [l.strip() for l in soup.get_text().split("\n") if l.strip()]:
             if "soldout" in line.lower() or "売り切れ" in line.lower(): return "❌ Sold Out"
             if "在庫あり" in line or ("in stock" in line.lower() and "out" not in line.lower()): return "✅ In Stock"
@@ -540,15 +562,31 @@ def scrape_sold_from_category(category_key, keywords, min_matches=2, max_soldout
         print(f"Error scraping category: {e}")
         return []
 
-def scrape_instock_from_category(category_key, max_items=30):
-    """Scrape in-stock items from an eaglecapitalone category page.
-    Product names live in <strong> tags. The main product photo is
-    identified via its distinctive 'src="URL" itemprop="image"' marker
-    (confirmed via raw HTML inspection — thumbnails don't carry this
-    marker, and the srcset attribute on the main image tag is too large
-    for reliable window-based backward searching). Images and names are
-    paired positionally since both appear once per product, in the same
-    document order."""
+eco_category_cache = {}  # cache_key -> {"data": [...], "timestamp": 0}
+ECO_CATEGORY_CACHE_DURATION = 600  # 10 minutes
+
+
+def scrape_instock_from_category(category_key, max_items=30, include_sold=False, force_refresh=False):
+    """Scrape items from an eaglecapitalone category page.
+    Uses BeautifulSoup to find each product's actual DOM container
+    (div[itemtype="http://schema.org/Product"]) and extracts
+    name/price/image/url/availability only from within that specific
+    subtree, guaranteeing correct pairing — no positional list matching.
+
+    By default only returns in-stock items (unchanged behavior for
+    existing callers like deal-checking). Pass include_sold=True to
+    also include sold-out items, each tagged with its availability.
+
+    Caches the full scraped+translated result per (category, include_sold)
+    combo for ECO_CATEGORY_CACHE_DURATION seconds, since translation is
+    the slow part of this call (one Google Translate request per product)
+    and most category contents don't change minute-to-minute. Pass
+    force_refresh=True to bypass the cache."""
+    cache_key = f"{category_key}_{include_sold}"
+    cached = eco_category_cache.get(cache_key)
+    if not force_refresh and cached and (time.time() - cached["timestamp"]) < ECO_CATEGORY_CACHE_DURATION:
+        return cached["data"][:max_items]
+
     url = ECO_CATEGORY_URLS.get(category_key)
     if not url:
         return []
@@ -556,42 +594,42 @@ def scrape_instock_from_category(category_key, max_items=30):
         scraper = make_scraper()
         response = scraper.get(url, timeout=20)
         if response.status_code != 200:
-            return []
-        html = response.text
+            return cached["data"][:max_items] if cached else []
+        soup = BeautifulSoup(response.text, "html.parser")
+        product_divs = soup.find_all("div", itemtype="http://schema.org/Product")
+
         items = []
-
-        # Main product images, in document order
-        main_imgs = [mm.group(1) for mm in re.finditer(r'src="([^"]+)"\s+itemprop="image"', html)]
-
-        strongs = list(re.finditer(r'<strong>(.*?)</strong>', html, re.DOTALL))
-        img_idx = 0
-        for m in strongs:
-            clean = re.sub(r'<.*?>', '', m.group(1)).strip()
-            if not clean or '￥' in clean or '¥' in clean or len(clean) < 3:
+        for pdiv in product_divs:
+            name_tag = pdiv.find("span", itemprop="name")
+            if not name_tag:
                 continue
-            name_jp = clean
-
-            chunk_after = html[m.end():m.end() + 2500]
-            price_match = re.search(r'[￥¥]([\d,]+)', chunk_after)
-            if not price_match:
-                continue
-            price_str = "￥" + price_match.group(1)
-
-            sold_out = bool(re.search(r'soldout|sold[\s_-]?out|売り切れ', chunk_after[:2000], re.IGNORECASE))
-            if sold_out:
-                img_idx += 1  # keep image list aligned even when skipping this item
+            name_jp = name_tag.get_text(strip=True)
+            if not name_jp:
                 continue
 
+            price_tag = pdiv.find(itemprop="price")
+            if not price_tag or not price_tag.get("content"):
+                continue
+            try:
+                price_str = "￥" + f"{int(price_tag['content']):,}"
+            except ValueError:
+                continue
+
+            avail_tag = pdiv.find(itemprop="availability")
+            is_sold_out = bool(avail_tag and avail_tag.get("content") == "OutOfStock")
+            if is_sold_out and not include_sold:
+                continue
+
+            img_tag = pdiv.find("img", itemprop="image")
             img_url = None
-            if img_idx < len(main_imgs):
-                img_url = main_imgs[img_idx]
+            if img_tag and img_tag.get("src"):
+                img_url = img_tag["src"]
                 if img_url.startswith("//"): img_url = "https:" + img_url
                 elif img_url.startswith("/"): img_url = "https://www.eaglecapitalone.com" + img_url
-            img_idx += 1
 
-            pid_match = re.search(r'productId=([A-Za-z0-9]+)', chunk_after)
-            if pid_match:
-                product_url = f"https://www.eaglecapitalone.com/j/shop/info/m/?productId={pid_match.group(1)}"
+            purl_tag = pdiv.find("meta", itemprop="url")
+            if purl_tag and purl_tag.get("content"):
+                product_url = purl_tag["content"].replace("//app", "/app")
             else:
                 product_url = url
 
@@ -604,17 +642,16 @@ def scrape_instock_from_category(category_key, max_items=30):
                 "img_url":     img_url,
                 "product_url": product_url,
                 "category":    category_key,
-                "source":      "eaglecapitalone"
+                "source":      "eaglecapitalone",
+                "sold_out":    is_sold_out
             })
 
-            if len(items) >= max_items:
-                break
-
-        print(f"ECO {category_key}: found {len(items)} in-stock items, {len(main_imgs)} main images available")
-        return items
+        eco_category_cache[cache_key] = {"data": items, "timestamp": time.time()}
+        print(f"ECO {category_key}: found {len(items)} items (DOM-scoped extraction, include_sold={include_sold}, freshly scraped)")
+        return items[:max_items]
     except Exception as e:
         print(f"ECO instock scrape error ({category_key}): {e}")
-        return []
+        return cached["data"][:max_items] if cached else []
 
 
 async def check_eco_deal_item(item, sgd_rate):
@@ -640,7 +677,41 @@ async def check_eco_deal_item(item, sgd_rate):
             print(f"Deal check error for {item['name_jp']}: {e}")
             return None
 
-
+DELTA_KEYWORD_JP_MAP = {
+    "feather":       ["フェザー"],
+    "large feather": ["特大フェザー", "フェザー（XL）"],
+    "eagle":         ["イーグル"],
+    "eagle ring":    ["リング", "イーグル"],
+    "feather ring":  ["リング", "フェザー"],
+    "bracelet":      ["ブレス"],
+    "face bracelet": ["ブレス", "顔"],
+    "leather brace": ["ブレス", "革"],
+    "wheel":         ["ホイール"],
+    "chain":         ["チェーン"],
+    "leather cord":  ["革紐"],
+    "metal":         ["メタル"],
+    "sun metal":     ["太陽メタル", "太陽"],
+    "sv sun":        ["SV太陽", "SVIN太陽"],
+    "gold sun":      ["K18太陽"],
+    "gold insun":    ["K18IN太陽"],
+    "cross":         ["クロス"],
+    "spoon":         ["スプーン"],
+    "top eagle":     ["トップ", "イーグル"],
+    "concho":        ["コンチョ"],
+    "heart":         ["ハート"],
+    "ring":          ["リング"],
+    "belt":          ["ベルト"],
+    "bag":           ["バッグ"],
+    "wallet":        ["財布"],
+    "beads":         ["ビーズ"],
+    "earring":       ["ピアス"],
+    "old":           ["OLD", "オールド"],
+    "rare":          ["希少"],
+    "very rare":     ["超希少"],
+    "custom":        ["特注"],
+    "current":       ["現行"],
+    "sale":          ["SALE", "セール"],
+}
 # ── ECO keyword-scoped search & deal helpers ──
 ECO_KEYWORD_JP_MAP = {
     "feather":       ["フェザー"],
@@ -649,6 +720,7 @@ ECO_KEYWORD_JP_MAP = {
     "plain feather": ["プレーンフェザー", "プレーン"],
     "used feather":  ["中古"],
     "gold tip":      ["先金"],
+    "gold top":      ["上金"],
     "wheel":         ["ホイール"],
     "hook":          ["フック"],
     "eagle":         ["イーグル"],
@@ -661,6 +733,10 @@ ECO_KEYWORD_JP_MAP = {
     "belt":          ["ベルト"],
     "spoon":         ["スプーン"],
     "gold":          ["ゴールド", "金"],
+    "claw":          ["爪"],
+    "sv sun":        ["SV太陽", "銀太陽", "SVIN太陽"],
+    "gold sun":      ["K18太陽"],
+    "gold insun":    ["K18IN太陽"],
 }
 
 def detect_eco_category(keyword):
@@ -670,6 +746,9 @@ def detect_eco_category(keyword):
     if "plain feather" in kw or "プレーン" in keyword: return "plainfeather"
     if "used feather" in kw: return "usedfeather"
     if "gold tip" in kw or "先金" in keyword: return "feather"
+    if "gold top" in kw or "上金" in keyword: return "feather"
+    if "claw" in kw or "爪" in keyword: return "feather"
+    if "sv sun" in kw or "gold sun" in kw or "gold insun" in kw: return "metal"
     if "sun metal" in kw or "太陽メタル" in keyword: return "metal"
     if "wheel" in kw or "ホイール" in keyword: return "wheel"
     if "hook" in kw or "フック" in keyword: return "hook"
@@ -686,7 +765,7 @@ def detect_eco_category(keyword):
 
 def search_eco_category(category_key, keyword, max_items=50, exclude_terms=None):
     try:
-        category_items = scrape_instock_from_category(category_key, max_items=100)
+        category_items = scrape_instock_from_category(category_key, max_items=100, include_sold=True)
         jp_keywords = ECO_KEYWORD_JP_MAP.get(keyword.lower(), [])
         exclude_terms = exclude_terms or []
         items = []
@@ -741,7 +820,8 @@ async def cmd_ecodeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "❌ Couldn't detect category.\n"
                 "Try: feather, large feather, wheel, hook, eagle, metal, sun metal, "
-                "bracelet, ring, concho, cross, belt, spoon, gold tip"
+                "bracelet, ring, concho, cross, belt, spoon, gold tip, claw, "
+                "sv sun, gold sun, gold insun"
             )
             return
 
@@ -1519,6 +1599,7 @@ def detect_deltaone_category(keyword):
     if "wheel" in kw or "ホイール" in keyword: return "wheel"
     if "leather cord" in kw or "革紐" in keyword: return "leathercord"
     if "chain" in kw or "チェーン" in keyword: return "chain"
+    if "sv sun" in kw or "gold sun" in kw or "gold insun" in kw: return "sunmetal"
     if "sun metal" in kw or "太陽メタル" in keyword: return "sunmetal"
     if "metal" in kw or "メタル" in keyword: return "metal"
     if "cross" in kw or "クロス" in keyword: return "cross"
@@ -1531,24 +1612,59 @@ def detect_deltaone_category(keyword):
     if "belt" in kw or "ベルト" in keyword: return "belt"
     if "beads" in kw or "ビーズ" in keyword: return "beads"
     if "earring" in kw or "ピアス" in keyword: return "earring"
-    if "old" in kw: return "old"
     if "very rare" in kw or "超希少" in keyword: return "veryrare"
     if "rare" in kw or "希少" in keyword: return "rare"
     if "custom" in kw or "特注" in keyword: return "custom"
     if "current" in kw or "現行" in keyword: return "current"
     if "sale" in kw or "セール" in keyword: return "sale"
+    if "old" in kw: return "old"
     return None
 
-def search_deltaone_category(category_url, max_items=10):
-    try:
-        scraper = make_scraper()
-        response = scraper.get(category_url, timeout=20)
-        if response.status_code != 200: return []
-        items = _parse_deltaone_links(BeautifulSoup(response.text, "html.parser"))
-        return items[:max_items]
-    except Exception as e:
-        print(f"DELTAone category search error: {e}"); return []
+deltaone_category_cache = {}  # category_url -> {"data": [...], "timestamp": 0}
+DELTAONE_CATEGORY_CACHE_DURATION = 600  # 10 minutes
 
+def search_deltaone_category(category_url, keyword=None, max_items=50, exclude_terms=None, force_refresh=False):
+    """Scrape a DELTAone category page. Caches the full scraped+translated
+    result per category_url for DELTAONE_CATEGORY_CACHE_DURATION seconds.
+    Filters results to only items whose name_jp contains one of the JP
+    terms mapped to `keyword` in DELTA_KEYWORD_JP_MAP — same jp_keywords/
+    exclude_terms pattern as search_eco_category and search_rinkan_category.
+
+    Matching is case-insensitive because DELTAone's actual product names
+    use mixed case for the fitting suffix (e.g. 'K18in太陽メタル', not
+    'K18IN太陽メタル'), which a case-sensitive `in` check would miss."""
+    cached = deltaone_category_cache.get(category_url)
+    if not force_refresh and cached and (time.time() - cached["timestamp"]) < DELTAONE_CATEGORY_CACHE_DURATION:
+        category_items = cached["data"]
+    else:
+        try:
+            scraper = make_scraper()
+            response = scraper.get(category_url, timeout=20)
+            if response.status_code != 200:
+                category_items = cached["data"] if cached else []
+            else:
+                category_items = _parse_deltaone_links(BeautifulSoup(response.text, "html.parser"))
+                deltaone_category_cache[category_url] = {"data": category_items, "timestamp": time.time()}
+        except Exception as e:
+            print(f"DELTAone category search error: {e}")
+            category_items = cached["data"] if cached else []
+
+    jp_keywords = DELTA_KEYWORD_JP_MAP.get((keyword or "").lower(), [])
+    exclude_terms = exclude_terms or []
+    if not jp_keywords:
+        return category_items[:max_items]
+
+    items = []
+    for it in category_items:
+        name_jp_upper = it["name_jp"].upper()
+        name_en_lower = it["name_en"].lower()
+        if any(ex.lower() in name_en_lower or ex.upper() in name_jp_upper for ex in exclude_terms):
+            continue
+        if any(jk.upper() in name_jp_upper for jk in jp_keywords):
+            items.append(it)
+        if len(items) >= max_items:
+            break
+    return items
 
 # ════════════════════════════════════════════════════════════════
 #  CONCURRENT HELPERS
@@ -1572,21 +1688,100 @@ async def check_rinkan_item_async(scraper, item):
 #  AUTO-CHECK + WATCHLIST
 # ════════════════════════════════════════════════════════════════
 async def auto_check_new_arrivals(context):
+    """Checks eaglecapitalone for new arrivals. Sends at most ONE notification
+    per calendar day (SGT) even if multiple date changes are detected during
+    the 6-8pm run window — last_eco_notify_day tracks the date a notification
+    was last actually sent, and resets naturally the next day."""
     try:
-        items, update_date = get_new_arrivals(force_refresh=True)
-        if not update_date: return
+        items, update_date = await asyncio.to_thread(get_new_arrivals, True)
+        if not update_date:
+            return
+
+        sgt = pytz.timezone("Asia/Singapore")
+        today_str = datetime.now(sgt).strftime("%Y-%m-%d")
+
         if update_date != last_known_update["date"] and last_known_update["date"] != "":
-            await context.bot.send_message(chat_id=context.job.chat_id, text=f"🔔 New arrivals posted!\n📅 {update_date}\n\nType /neweco to see the latest items.")
-            watches = get_watches(context.job.chat_id)
-            for watch in watches:
-                for m in [i for i in items if item_matches_watch(i, watch)][:3]:
-                    rates = get_rates(base="JPY"); sgd_rate = rates.get("SGD")
-                    text = f"👁️ Watchlist match: '{watch['keyword']}'\n\n{m['name_en']}\n({m['name_jp']})\n{format_price(m['price'], sgd_rate)}"
-                    if m.get("product_url"): text += f"\n🔗 {m['product_url']}"
-                    await safe_send(context, context.job.chat_id, photo=m.get("img_url"), caption=text if m.get("img_url") else None, text=text if not m.get("img_url") else None)
+            if last_eco_notify_day["date"] != today_str:
+                await context.bot.send_message(
+                    chat_id=context.job.chat_id,
+                    text=f"🔔 New arrivals posted!\n📅 {update_date}\n\nType /neweco to see the latest items."
+                )
+                watches = get_watches(context.job.chat_id)
+                for watch in watches:
+                    for m in [i for i in items if item_matches_watch(i, watch)][:3]:
+                        rates = get_rates(base="JPY")
+                        sgd_rate = rates.get("SGD")
+                        text = f"👁️ Watchlist match: '{watch['keyword']}'\n\n{m['name_en']}\n({m['name_jp']})\n{format_price(m['price'], sgd_rate)}"
+                        if m.get("product_url"):
+                            text += f"\n🔗 {m['product_url']}"
+                        await safe_send(
+                            context, context.job.chat_id,
+                            photo=m.get("img_url"),
+                            caption=text if m.get("img_url") else None,
+                            text=text if not m.get("img_url") else None
+                        )
+                last_eco_notify_day["date"] = today_str
+
         last_known_update["date"] = update_date
     except Exception as e:
         print(f"Auto-check error: {e}")
+
+
+async def auto_check_rinkan_new(context):
+    """Every-5-min checker for new Rinkan drops. Compares the current
+    'new items' page against the previously seen set of product URLs;
+    any URL not seen before is treated as a fresh drop. First run only
+    seeds the baseline so it doesn't spam old items as 'new'."""
+    global last_known_rinkan_urls
+    try:
+        sgt = pytz.timezone("Asia/Singapore")
+        now_sgt = datetime.now(sgt).time()
+        if dtime(18, 0) <= now_sgt <= dtime(20, 0):
+            return  # paused — eaglecapitalone has the 6-8pm window to itself
+        items = await asyncio.to_thread(get_rinkan_new_arrivals, True)
+        if not items:
+            return
+        current_urls = {i["product_url"] for i in items}
+        if last_known_rinkan_urls:
+            new_items = [i for i in items if i["product_url"] not in last_known_rinkan_urls]
+            if new_items:
+                rates = get_rates(base="JPY"); sgd_rate = rates.get("SGD")
+                for i in new_items[:5]:
+                    text = f"🆕 New Rinkan drop!\n\n{i['name_en']}\n({i['name_jp']})\n{format_price(i['price'], sgd_rate)}\n🔗 {i['product_url']}"
+                    await safe_send(context, context.job.chat_id, photo=i.get("img_url"),
+                                     caption=text if i.get("img_url") else None,
+                                     text=text if not i.get("img_url") else None)
+        last_known_rinkan_urls = current_urls
+    except Exception as e:
+        print(f"Rinkan auto-check error: {e}")
+
+
+async def auto_check_delta_new(context):
+    """Every-5-min checker for new DELTAone drops. Same seen-URL diffing
+    approach as the Rinkan checker above."""
+    global last_known_delta_urls
+    try:
+        sgt = pytz.timezone("Asia/Singapore")
+        now_sgt = datetime.now(sgt).time()
+        if dtime(18, 0) <= now_sgt <= dtime(20, 0):
+            return  # paused — eaglecapitalone has the 6-8pm window to itself
+        items = await asyncio.to_thread(get_deltaone_new_arrivals, 15)
+        if not items:
+            return
+        current_urls = {i["product_url"] for i in items}
+        if last_known_delta_urls:
+            new_items = [i for i in items if i["product_url"] not in last_known_delta_urls]
+            if new_items:
+                rates = get_rates(base="JPY"); sgd_rate = rates.get("SGD")
+                for i in new_items[:5]:
+                    availability = "❌ Sold Out" if i["sold_out"] else "✅ In Stock"
+                    text = f"🆕 New DELTAone drop!\n\n{i['name_en']}\n({i['name_jp']})\n{format_price(i['price'], sgd_rate)}\n{availability}\n🔗 {i['product_url']}"
+                    await safe_send(context, context.job.chat_id, photo=i.get("img_url"),
+                                     caption=text if i.get("img_url") else None,
+                                     text=text if not i.get("img_url") else None)
+        last_known_delta_urls = current_urls
+    except Exception as e:
+        print(f"DELTAone auto-check error: {e}")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1804,11 +1999,18 @@ async def cmd_ecosearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ Couldn't detect category.\n"
             "Try: feather, large feather, wheel, hook, eagle, metal, sun metal, "
-            "bracelet, ring, concho, cross, belt, spoon, gold tip"
+            "bracelet, ring, concho, cross, belt, spoon, gold tip, gold top, claw, "
+            "sv sun, gold sun, gold insun"
         )
         return
 
     await update.message.reply_text(f"🔍 Searching eaglecapitalone for '{keyword}' (page {page})... please wait")
+
+    exclude_terms = []
+    if keyword.lower() == "sv sun":
+        exclude_terms = ["k18"]
+    elif keyword.lower() == "gold sun":
+        exclude_terms = ["k18in"]
 
     all_items = search_eco_category(category_key, keyword, max_items=100)
     if not all_items:
@@ -1836,7 +2038,8 @@ async def cmd_ecosearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⏸️ Stopped. Type /resume to continue.")
             return
         price_line = format_price(i["price"], sgd_rate)
-        caption = f"{idx}. {i['name_en']}\n({i['name_jp']})\n{price_line}\n✅ In Stock\n🏪 Source: eaglecapitalone\n🔗 {i['product_url']}"
+        availability = "❌ Sold Out" if i.get("sold_out") else "✅ In Stock"
+        caption = f"{idx}. {i['name_en']}\n({i['name_jp']})\n{price_line}\n{availability}\n🏪 Source: eaglecapitalone\n🔗 {i['product_url']}"
         await safe_send(context, update.effective_chat.id, photo=i.get("img_url"), caption=caption if i.get("img_url") else None, text=caption if not i.get("img_url") else None)
 
     if page < total_pages:
@@ -1848,23 +2051,93 @@ async def cmd_ecosearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_deltasearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_not_paused(update): return
     chat_id = update.effective_chat.id
-    keyword = " ".join(context.args).strip()
-    if not keyword: await update.message.reply_text("Usage: /deltasearch <keyword>\nExample: /deltasearch feather\n\nCategories: feather, largefeather, eagle, bracelet, wheel, chain, metal, sunmetal, cross, spoon, heart, concho, ring, belt, bag, wallet, beads, earring, old, rare, custom, current, sale"); return
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /deltasearch <keyword> [page]\n"
+            "Example: /deltasearch feather\n"
+            "/deltasearch feather 2 — for page 2\n"
+            "/deltasearch 2 — page 2 of your last search\n\n"
+            "Categories: feather, largefeather, eagle, bracelet, wheel, chain, metal, sunmetal, "
+            "cross, spoon, heart, concho, ring, belt, bag, wallet, beads, earring, old, rare, custom, current, sale"
+        )
+        return
+
+    # Bare page number (e.g. "/deltasearch 2") reuses the last keyword for this chat
+    if len(args) == 1 and args[0].isdigit():
+        page = int(args[0])
+        keyword = last_delta_search.get(chat_id)
+        if not keyword:
+            await update.message.reply_text("❌ No previous search found. Try /deltasearch <keyword> first.")
+            return
+    elif len(args) > 1 and args[-1].isdigit():
+        page = int(args[-1])
+        keyword = " ".join(args[:-1]).strip()
+    else:
+        page = 1
+        keyword = " ".join(args).strip()
+
+    if not keyword:
+        await update.message.reply_text("Usage: /deltasearch <keyword> [page]")
+        return
+
     category_key = detect_deltaone_category(keyword)
-    if not category_key: await update.message.reply_text("❌ Couldn't detect category.\nTry: feather, eagle, bracelet, wheel, chain, metal, cross, spoon, heart, concho, ring, belt, bag, wallet, old, rare, custom"); return
+    if not category_key:
+        await update.message.reply_text(
+            "❌ Couldn't detect category.\n"
+            "Try: feather, eagle, bracelet, wheel, chain, metal, cross, spoon, heart, concho, ring, belt, bag, wallet, old, rare, custom"
+        )
+        return
     category_url = DELTAONE_CATEGORY_URLS.get(category_key)
-    await update.message.reply_text(f"🔍 Searching DELTAone for '{keyword}'... please wait")
-    items = search_deltaone_category(category_url, max_items=10)
-    if not items: await update.message.reply_text(f"❌ No items found for '{keyword}'"); return
+    last_delta_search[chat_id] = keyword  # remember for bare-page-number follow-ups
+
+    await update.message.reply_text(f"🔍 Searching DELTAone for '{keyword}' (page {page})... please wait")
+
+    exclude_terms = []
+    if keyword.lower() == "sv sun":
+        exclude_terms = ["k18"]
+    elif keyword.lower() == "gold sun":
+        exclude_terms = ["k18in"]
+
+    all_items = search_deltaone_category(category_url, keyword=keyword, max_items=100, exclude_terms=exclude_terms)
+    if not all_items:
+        await update.message.reply_text(f"❌ No items found for '{keyword}'")
+        return
+
+    all_items.sort(key=lambda i: _price_to_int(i["price"]))  # cheapest first
+
+    PAGE_SIZE = 10
+    total_items = len(all_items)
+    total_pages = (total_items + PAGE_SIZE - 1) // PAGE_SIZE
+    if page < 1: page = 1
+    if page > total_pages: page = total_pages
+    start = (page - 1) * PAGE_SIZE
+    end = start + PAGE_SIZE
+    items = all_items[start:end]
+
     rates = get_rates(base="JPY"); sgd_rate = rates.get("SGD")
-    await update.message.reply_text(f"🔍 DELTAone Results for '{keyword}' ({len(items)} found)\n{'─'*30}")
-    for idx, i in enumerate(items, 1):
-        if is_paused(chat_id): await update.message.reply_text(f"⏸️ Stopped at item {idx}/{len(items)}. Type /resume to continue."); return
+    await update.message.reply_text(
+        f"🔍 DELTAone Results for '{keyword}' — page {page}/{total_pages} "
+        f"({total_items} total, cheapest first)\n{'─'*30}"
+    )
+    for idx, i in enumerate(items, start + 1):
+        if is_paused(chat_id):
+            await update.message.reply_text("⏸️ Stopped. Type /resume to continue.")
+            return
         price_line = format_price(i["price"], sgd_rate)
         availability = "❌ Sold Out" if i["sold_out"] else "✅ In Stock"
         caption = f"{idx}. {i['name_en']}\n({i['name_jp']})\n{price_line}\n{availability}\n🏪 Source: DELTAone\n🔗 {i['product_url']}"
         await safe_send(context, update.effective_chat.id, photo=i.get("img_url"), caption=caption if i.get("img_url") else None, text=caption if not i.get("img_url") else None)
 
+    if page < total_pages:
+        await update.message.reply_text(
+            f"ℹ️ Page {page}/{total_pages}. Type /deltasearch {keyword} {page+1} for the next page — "
+            f"or just /deltasearch {page+1}"
+        )
+def _price_to_int(price_str):
+    """Extract the numeric JPY value from a price string like '¥140,000' for sorting."""
+    digits = re.sub(r'[^\d]', '', price_str or '')
+    return int(digits) if digits else float('inf')
 
 async def cmd_soldhistory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_not_paused(update): return
@@ -1992,23 +2265,45 @@ async def cmd_notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.job_queue is None:
         await update.message.reply_text("❌ JobQueue not available. Please ensure python-telegram-bot[job-queue] is installed.")
         return
-    for job in context.job_queue.get_jobs_by_name(str(chat_id)):
-        job.schedule_removal()
-    sgt = pytz.timezone("Asia/Singapore")
-    times = [dtime(h, m, tzinfo=sgt) for h, m in [(18,0),(18,30),(19,0),(19,30),(20,0)]]
-    for t in times:
-        context.job_queue.run_daily(auto_check_new_arrivals, time=t, chat_id=chat_id, name=f"{chat_id}_{t.hour}_{t.minute}")
-    await update.message.reply_text("✅ Notifications enabled!\n🕕 Checking at 6:00, 6:30, 7:00, 7:30, 8:00 PM SGT.\n👁️ Watchlist also checked.\nType /notifyoff to disable.")
 
+    # Remove any existing jobs for this chat (eco time-slots + rinkan/delta repeaters)
+    for job in context.job_queue.jobs():
+        if job.name and job.name.startswith(f"{chat_id}_"):
+            job.schedule_removal()
+
+    sgt = pytz.timezone("Asia/Singapore")
+
+    # eaglecapitalone: every 5 min from 6:00pm to 8:00pm SGT
+    times = []
+    for h in (18, 19):
+        for m in range(0, 60, 5):
+            times.append(dtime(h, m, tzinfo=sgt))
+    times.append(dtime(20, 0, tzinfo=sgt))  # include 8:00pm exactly
+    for t in times:
+        context.job_queue.run_daily(auto_check_new_arrivals, time=t, chat_id=chat_id, name=f"{chat_id}_eco_{t.hour}_{t.minute}")
+
+    # Rinkan & DELTAone: every 5 min, all day (both pause themselves during 6-8pm)
+    context.job_queue.run_repeating(auto_check_rinkan_new, interval=300, first=15, chat_id=chat_id, name=f"{chat_id}_rinkan5min")
+    context.job_queue.run_repeating(auto_check_delta_new, interval=300, first=20, chat_id=chat_id, name=f"{chat_id}_delta5min")
+
+    await update.message.reply_text(
+        "✅ Notifications enabled!\n"
+        "🕕 eaglecapitalone: every 5 min, 6:00-8:00 PM SGT (max 1 alert/day)\n"
+        "⏱️ Rinkan: every 5 min, all day (paused 6-8pm)\n"
+        "⏱️ DELTAone: every 5 min, all day (paused 6-8pm)\n"
+        "👁️ Watchlist also checked on eco runs.\n"
+        "Type /notifyoff to disable."
+    )
 async def cmd_notifyoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if context.job_queue is None:
         await update.message.reply_text("❌ JobQueue not available.")
         return
     removed = 0
-    for h, m in [(18,0),(18,30),(19,0),(19,30),(20,0)]:
-        for job in context.job_queue.get_jobs_by_name(f"{chat_id}_{h}_{m}"):
-            job.schedule_removal(); removed += 1
+    for job in context.job_queue.jobs():
+        if job.name and job.name.startswith(f"{chat_id}_"):
+            job.schedule_removal()
+            removed += 1
     await update.message.reply_text("🔕 Notifications disabled." if removed else "⚠️ No active notifications to disable.")
 
 
@@ -2033,7 +2328,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/watch <keyword> [max_price] — Add a watch\n"
         "/unwatch <keyword> — Remove a watch\n"
         "/watchlist — View your active watches\n\n"
-        "🔔 Notifications:\n/notify — Auto alert (+ watchlist)\n/notifyoff — Disable notifications\n\n"
+        "🔔 Notifications:\n/notify — Auto alert (eco time-slots + Rinkan/DELTAone every 5 min, all day)\n/notifyoff — Disable notifications\n\n"
         "⏸️ Control:\n/stop — Pause/stop a running search\n/resume — Resume search commands\n\n"
         "🕐 Sold History:\n/soldhistory — View sold price history\n/soldonsite wheel sv — Search sold items\n\n"
         "🪶 Goro's Price Search:\n/price <keyword> — Free search\n"
@@ -2089,7 +2384,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "(for /ecosearch <keyword> and /ecodeal <keyword>)\n"
             + "─"*30 + "\n\n"
             "feather, large feather, heart feather, plain feather, used feather, gold tip\n"
-            "wheel, hook, eagle, metal, sun metal, gold\n"
+            "wheel, hook, eagle, metal, sun metal, gold, claw, sv sun, gold sun, gold insun\n"
             "bracelet, ring, concho, cross, belt, spoon\n\n"
             "📄 Paging:\n"
             "/ecosearch <keyword> <page> — e.g. /ecosearch feather 2\n\n"
