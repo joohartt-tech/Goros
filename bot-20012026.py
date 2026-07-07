@@ -305,6 +305,72 @@ def parse_price_number(price_str):
     except Exception:
         return None
 
+def parse_search_query(args):
+    """Parses search command args into (keyword, include_terms, exclude_terms, min_price, max_price, page).
+
+    Syntax:
+      /ecosearch large feather +gold top -turquoise 100000-300000
+      /ecosearch large feather 100000+        (min price only)
+      /ecosearch large feather <300000        (max price only)
+      /ecosearch large feather 2              (page 2, only if nothing else numeric)
+
+    +phrase / -phrase collect words until the next +/-/price-token/end of args."""
+    keyword_tokens, include_phrases, exclude_phrases = [], [], []
+    min_price = max_price = None
+    bucket = keyword_tokens
+
+    for tok in args:
+        range_match = re.match(r'^(\d+)-(\d+)$', tok)
+        plus_match = re.match(r'^(\d+)\+$', tok)
+        lt_match = re.match(r'^<(\d+)$', tok)
+        gt_match = re.match(r'^>(\d+)$', tok)
+        if range_match:
+            min_price, max_price = float(range_match.group(1)), float(range_match.group(2)); continue
+        if plus_match:
+            min_price = float(plus_match.group(1)); continue
+        if lt_match:
+            max_price = float(lt_match.group(1)); continue
+        if gt_match:
+            min_price = float(gt_match.group(1)); continue
+        if tok.startswith('+') and len(tok) > 1:
+            bucket = []; include_phrases.append(bucket); bucket.append(tok[1:]); continue
+        if tok.startswith('-') and len(tok) > 1 and not tok[1:].isdigit():
+            bucket = []; exclude_phrases.append(bucket); bucket.append(tok[1:]); continue
+        bucket.append(tok)
+
+    page = 1
+    if len(keyword_tokens) > 1 and keyword_tokens[-1].isdigit():
+        page = int(keyword_tokens.pop())
+
+    keyword = " ".join(keyword_tokens).strip()
+    include_terms = [" ".join(p).strip() for p in include_phrases if p]
+    exclude_terms = [" ".join(p).strip() for p in exclude_phrases if p]
+    return keyword, include_terms, exclude_terms, min_price, max_price, page
+
+
+def apply_query_filters(items, include_terms, exclude_terms, min_price, max_price):
+    """Applies +include/-exclude phrases and a price range to an already-fetched
+    item list. include_terms must ALL be present (AND); exclude_terms block if
+    ANY are present. Matching is against combined name_en + name_jp, lowercased."""
+    filtered = []
+    for it in items:
+        combined = (it.get("name_en", "") + " " + it.get("name_jp", "")).lower()
+        if include_terms and not all(term.lower() in combined for term in include_terms):
+            continue
+        if exclude_terms and any(term.lower() in combined for term in exclude_terms):
+            continue
+        if min_price is not None or max_price is not None:
+            price_num = parse_price_number(it.get("price", ""))
+            if price_num is None:
+                continue
+            if min_price is not None and price_num < min_price:
+                continue
+            if max_price is not None and price_num > max_price:
+                continue
+        filtered.append(it)
+    return filtered
+
+
 def format_price(price_str, sgd_rate):
     numeric = parse_price_number(price_str)
     if numeric is None:
@@ -1537,6 +1603,7 @@ def search_rinkan_category(category_url, keyword, max_items=10, exclude_jp=None)
                 "img_url": it["img_url"],
                 "product_url": it["product_url"],
                 "source": "Rinkan",
+                "sold_out": it.get("sold_out", False),
             })
             if len(items) >= max_items:
                 break
@@ -1896,22 +1963,18 @@ async def cmd_rinkansearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Usage: /rinsearch <keyword> [page]\n"
+            "Usage: /rinsearch <keyword> [+term] [-term] [price range] [page]\n"
             "Example: /rinsearch feather\n"
-            "/rinsearch feather 2 — for page 2"
+            "/rinsearch feather 2 — for page 2\n"
+            "/rinsearch large feather +gold top -turquoise 100000-300000\n"
+            "Price ranges: 100000-300000, 100000+, <300000"
         )
         return
 
-    # If the last arg is a page number, split it off from the keyword
-    page = 1
-    if len(args) > 1 and args[-1].isdigit():
-        page = int(args[-1])
-        keyword = " ".join(args[:-1]).strip()
-    else:
-        keyword = " ".join(args).strip()
+    keyword, include_terms, exclude_extra, min_price, max_price, page = parse_search_query(args)
 
     if not keyword:
-        await update.message.reply_text("Usage: /rinsearch <keyword> [page]")
+        await update.message.reply_text("Usage: /rinsearch <keyword> [+term] [-term] [price range] [page]")
         return
 
     category_key = detect_rinkan_category(keyword)
@@ -1930,10 +1993,16 @@ async def cmd_rinkansearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exclude_jp = ["上金", "ターコイズ", "メタル付"]
     elif keyword.lower() == "wheel":
         exclude_jp = ["フェザー"]
+    exclude_jp += exclude_extra
 
     all_items = search_rinkan_category(category_url, keyword, max_items=100, exclude_jp=exclude_jp)
     if not all_items:
         await update.message.reply_text(f"❌ No items found for '{keyword}'")
+        return
+
+    all_items = apply_query_filters(all_items, include_terms, [], min_price, max_price)
+    if not all_items:
+        await update.message.reply_text(f"❌ No items matched your filters for '{keyword}'.")
         return
 
     # Sort by price ascending (lowest first)
@@ -1982,21 +2051,18 @@ async def cmd_ecosearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Usage: /ecosearch <keyword> [page]\n"
+            "Usage: /ecosearch <keyword> [+term] [-term] [price range] [page]\n"
             "Example: /ecosearch feather\n"
-            "/ecosearch feather 2 — for page 2"
+            "/ecosearch feather 2 — for page 2\n"
+            "/ecosearch large feather +gold top -turquoise 100000-300000\n"
+            "Price ranges: 100000-300000, 100000+, <300000"
         )
         return
 
-    page = 1
-    if len(args) > 1 and args[-1].isdigit():
-        page = int(args[-1])
-        keyword = " ".join(args[:-1]).strip()
-    else:
-        keyword = " ".join(args).strip()
+    keyword, include_terms, exclude_extra, min_price, max_price, page = parse_search_query(args)
 
     if not keyword:
-        await update.message.reply_text("Usage: /ecosearch <keyword> [page]")
+        await update.message.reply_text("Usage: /ecosearch <keyword> [+term] [-term] [price range] [page]")
         return
 
     category_key = detect_eco_category(keyword)
@@ -2016,10 +2082,16 @@ async def cmd_ecosearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exclude_terms = ["k18"]
     elif keyword.lower() == "gold sun":
         exclude_terms = ["k18in"]
+    exclude_terms += exclude_extra
 
     all_items = search_eco_category(category_key, keyword, max_items=100, exclude_terms=exclude_terms)
     if not all_items:
         await update.message.reply_text(f"❌ No items found for '{keyword}'")
+        return
+
+    all_items = apply_query_filters(all_items, include_terms, [], min_price, max_price)
+    if not all_items:
+        await update.message.reply_text(f"❌ No items matched your filters for '{keyword}'.")
         return
 
     # Page order is already newest-posted-first — no re-sort needed
@@ -2059,14 +2131,17 @@ async def cmd_deltasearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Usage: /deltasearch <keyword> [page]\n"
+            "Usage: /deltasearch <keyword> [+term] [-term] [price range] [page]\n"
             "Example: /deltasearch feather\n"
             "/deltasearch feather 2 — for page 2\n"
-            "/deltasearch 2 — page 2 of your last search\n\n"
+            "/deltasearch 2 — page 2 of your last search\n"
+            "/deltasearch large feather +gold top -turquoise 100000-300000\n\n"
             "Categories: feather, largefeather, eagle, bracelet, wheel, chain, metal, sunmetal, "
             "cross, spoon, heart, concho, ring, belt, bag, wallet, beads, earring, old, rare, custom, current, sale"
         )
         return
+
+    include_terms, exclude_extra, min_price, max_price = [], [], None, None
 
     # Bare page number (e.g. "/deltasearch 2") reuses the last keyword for this chat
     if len(args) == 1 and args[0].isdigit():
@@ -2075,15 +2150,11 @@ async def cmd_deltasearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not keyword:
             await update.message.reply_text("❌ No previous search found. Try /deltasearch <keyword> first.")
             return
-    elif len(args) > 1 and args[-1].isdigit():
-        page = int(args[-1])
-        keyword = " ".join(args[:-1]).strip()
     else:
-        page = 1
-        keyword = " ".join(args).strip()
+        keyword, include_terms, exclude_extra, min_price, max_price, page = parse_search_query(args)
 
     if not keyword:
-        await update.message.reply_text("Usage: /deltasearch <keyword> [page]")
+        await update.message.reply_text("Usage: /deltasearch <keyword> [+term] [-term] [price range] [page]")
         return
 
     category_key = detect_deltaone_category(keyword)
@@ -2103,10 +2174,16 @@ async def cmd_deltasearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exclude_terms = ["k18"]
     elif keyword.lower() == "gold sun":
         exclude_terms = ["k18in"]
+    exclude_terms += exclude_extra
 
     all_items = search_deltaone_category(category_url, keyword=keyword, max_items=100, exclude_terms=exclude_terms)
     if not all_items:
         await update.message.reply_text(f"❌ No items found for '{keyword}'")
+        return
+
+    all_items = apply_query_filters(all_items, include_terms, [], min_price, max_price)
+    if not all_items:
+        await update.message.reply_text(f"❌ No items matched your filters for '{keyword}'.")
         return
 
     all_items.sort(key=lambda i: _price_to_int(i["price"]))  # cheapest first
@@ -2139,6 +2216,95 @@ async def cmd_deltasearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"ℹ️ Page {page}/{total_pages}. Type /deltasearch {keyword} {page+1} for the next page — "
             f"or just /deltasearch {page+1}"
         )
+
+
+async def cmd_searchall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_not_paused(update): return
+    chat_id = update.effective_chat.id
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: /searchall <keyword> [+term] [-term] [price range] [page]\n"
+            "Example: /searchall large feather 100000-300000\n"
+            "Searches eaglecapitalone, Rinkan, and DELTAone together, merged and price-sorted."
+        )
+        return
+
+    keyword, include_terms, exclude_extra, min_price, max_price, page = parse_search_query(args)
+    if not keyword:
+        await update.message.reply_text("Usage: /searchall <keyword> [filters] [page]")
+        return
+
+    await update.message.reply_text(f"🔍 Searching all 3 sites for '{keyword}'... please wait")
+
+    all_items = []
+
+    eco_category = detect_eco_category(keyword)
+    if eco_category:
+        eco_exclude = (["k18"] if keyword.lower() == "sv sun" else ["k18in"] if keyword.lower() == "gold sun" else []) + exclude_extra
+        eco_items = await asyncio.to_thread(search_eco_category, eco_category, keyword, 100, eco_exclude)
+        for i in eco_items:
+            i["site_label"] = "eaglecapitalone"
+        all_items.extend(eco_items)
+
+    rin_category = detect_rinkan_category(keyword)
+    if rin_category:
+        rin_url = RINKAN_CATEGORY_URLS.get(rin_category)
+        rin_exclude = (["上金", "ターコイズ", "メタル付"] if keyword.lower() == "gold" else ["フェザー"] if keyword.lower() == "wheel" else [])
+        rin_items = await asyncio.to_thread(search_rinkan_category, rin_url, keyword, 100, rin_exclude)
+        for i in rin_items:
+            i["site_label"] = "Rinkan"
+        all_items.extend(rin_items)
+
+    delta_category = detect_deltaone_category(keyword)
+    if delta_category:
+        delta_url = DELTAONE_CATEGORY_URLS.get(delta_category)
+        delta_exclude = (["k18"] if keyword.lower() == "sv sun" else ["k18in"] if keyword.lower() == "gold sun" else []) + exclude_extra
+        delta_items = await asyncio.to_thread(search_deltaone_category, delta_url, keyword=keyword, max_items=100, exclude_terms=delta_exclude)
+        for i in delta_items:
+            i["site_label"] = "DELTAone"
+        all_items.extend(delta_items)
+
+    if not all_items:
+        await update.message.reply_text(f"❌ No items found for '{keyword}' on any site.")
+        return
+
+    all_items = apply_query_filters(all_items, include_terms, [], min_price, max_price)
+    if not all_items:
+        await update.message.reply_text(f"❌ No items matched your filters for '{keyword}'.")
+        return
+
+    all_items.sort(key=lambda i: (parse_price_number(i["price"]) if parse_price_number(i["price"]) is not None else float("inf")))
+
+    PAGE_SIZE = 10
+    total_items = len(all_items)
+    total_pages = (total_items + PAGE_SIZE - 1) // PAGE_SIZE
+    if page < 1: page = 1
+    if page > total_pages: page = total_pages
+    start = (page - 1) * PAGE_SIZE
+    end = start + PAGE_SIZE
+    items = all_items[start:end]
+
+    rates = get_rates(base="JPY"); sgd_rate = rates.get("SGD")
+    await update.message.reply_text(
+        f"🔍 Cross-Site Results for '{keyword}' — page {page}/{total_pages} "
+        f"({total_items} total across all 3 sites, cheapest first)\n{'─'*30}"
+    )
+    for idx, i in enumerate(items, start + 1):
+        if is_paused(chat_id):
+            await update.message.reply_text("⏸️ Stopped. Type /resume to continue.")
+            return
+        price_line = format_price(i["price"], sgd_rate)
+        availability = "❌ Sold Out" if i.get("sold_out") else "✅ In Stock"
+        caption = f"{idx}. [{i['site_label']}] {i['name_en']}\n({i['name_jp']})\n{price_line}\n{availability}\n🔗 {i['product_url']}"
+        await safe_send(context, update.effective_chat.id, photo=i.get("img_url"), caption=caption if i.get("img_url") else None, text=caption if not i.get("img_url") else None)
+
+    if page < total_pages:
+        await update.message.reply_text(
+            f"ℹ️ Page {page}/{total_pages}. Type /searchall {keyword} {page+1} for the next page."
+        )
+
+
 def _price_to_int(price_str):
     """Extract the numeric JPY value from a price string like '¥140,000' for sorting."""
     digits = re.sub(r'[^\d]', '', price_str or '')
@@ -2328,7 +2494,8 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/newdelta — DELTAone newest items\n"
         "/rinsearch <keyword> [page] — Search Rinkan by category, price-sorted\n"
         "/ecosearch <keyword> [page] — Search eaglecapitalone by category, price-sorted\n"
-        "/deltasearch <keyword> — Search DELTAone by category\n\n"
+        "/deltasearch <keyword> — Search DELTAone by category\n"
+        "/searchall <keyword> — Search all 3 sites at once, merged & price-sorted\n\n"
         "👁️ Watchlist:\n"
         "/watch <keyword> [max_price] — Add a watch\n"
         "/unwatch <keyword> — Remove a watch\n"
@@ -2453,6 +2620,7 @@ async def main():
     app.add_handler(CommandHandler("rinsearch", cmd_rinkansearch))
     app.add_handler(CommandHandler("ecosearch", cmd_ecosearch))
     app.add_handler(CommandHandler("deltasearch", cmd_deltasearch))
+    app.add_handler(CommandHandler("searchall", cmd_searchall))
     app.add_handler(CommandHandler("soldhistory", cmd_soldhistory))
     app.add_handler(CommandHandler("soldonsite", cmd_soldonsite))
     app.add_handler(CommandHandler("healthcheck", cmd_healthcheck))
