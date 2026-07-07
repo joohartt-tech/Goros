@@ -1553,6 +1553,7 @@ def _parse_deltaone_links(soup):
     for link in soup.find_all("a", href=re.compile(r'/collections/.+/products/')):
         href = link.get("href", "")
         full_url = href if href.startswith("http") else "https://www.deltaone.jp" + href
+        full_url = full_url.split("?")[0]  # strip session/tracking query params (e.g. ?_pos=&_sid=&_ss=) so the same product always yields the same URL for dedup — Shopify regenerates these on every page load, which was breaking the "seen before" check in auto_check_delta_new and causing repeat notifications for the same item
         if full_url in seen_urls: continue
         seen_urls.add(full_url)
         raw_text = link.get_text(strip=True)
@@ -1758,7 +1759,11 @@ async def auto_check_rinkan_new(context):
 
 async def auto_check_delta_new(context):
     """Every-5-min checker for new DELTAone drops. Same seen-URL diffing
-    approach as the Rinkan checker above."""
+    approach as the Rinkan checker above. Now that _parse_deltaone_links
+    strips Shopify's session/tracking query string from product_url, the
+    same physical product always yields the same URL between scrapes, so
+    it correctly gets marked 'already seen' instead of re-triggering a
+    notification every 5-minute cycle."""
     global last_known_delta_urls
     try:
         sgt = pytz.timezone("Asia/Singapore")
@@ -2012,7 +2017,7 @@ async def cmd_ecosearch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif keyword.lower() == "gold sun":
         exclude_terms = ["k18in"]
 
-    all_items = search_eco_category(category_key, keyword, max_items=100)
+    all_items = search_eco_category(category_key, keyword, max_items=100, exclude_terms=exclude_terms)
     if not all_items:
         await update.message.reply_text(f"❌ No items found for '{keyword}'")
         return
